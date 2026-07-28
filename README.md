@@ -1,6 +1,133 @@
 # Latent Diffusion Models
 [arXiv](https://arxiv.org/abs/2112.10752) | [BibTeX](#bibtex)
 
+---
+
+## 1D IMU Latent Diffusion
+
+This repository has been extended with a parallel 1D pipeline for generating realistic IMU sequences conditioned on trajectory. The 2D image code is fully preserved.
+
+### Data Flow: Training
+
+```
+real IMU [B, 6, 2000]
+  → per-channel standardization (dataset-wide mean/std)
+  → frozen VAE encoder
+  → clean latent z₀ [B, 8, 100]
+  → latent scaling (z₀ × scale_factor)
+  → sample t ~ U(0,999), noise ε ~ N(0,I)
+  → noisy latent zₜ [B, 8, 100]
+
+zₜ [B, 8, 100] ∥ velocity [B, 2, 100] ∥ physical_time [B, 1, 100]
+  → concatenate → [B, 11, 100]
+  → 1D conditional U-Net (with sinusoidal timestep embedding)
+  → predicted noise ε̂ [B, 8, 100]
+  → loss = MSE(ε̂, ε)
+```
+
+### Data Flow: Sim-to-Real Inference
+
+```
+synthetic IMU [B, 6, 2000]
+  → standardization (same training stats)
+  → VAE encoder → synthetic latent [B, 8, 100]
+  → latent scaling
+  → q_sample at t_start (determined by strength ∈ [0,1])
+  → partially noised latent
+  → DDIM reverse denoising (conditioned on velocity + physical_time)
+  → generated latent [B, 8, 100]
+  → inverse latent scaling
+  → VAE decoder → standardized generated IMU [B, 6, 2000]
+  → inverse standardization → generated IMU in physical units
+```
+
+### Architecture
+
+| Component | Input Shape | Output Shape | Key Parameters |
+|-----------|-------------|--------------|----------------|
+| **Encoder1D** | [B, 6, 2000] | [B, 16, 100] | ch=64, ch_mult=(1,2,4), downsample=(2,2,5) |
+| **Decoder1D** | [B, 8, 100] | [B, 6, 2000] | upsample=(5,2,2), num_res_blocks=2 |
+| **UNetModel1D** | [B, 11, 100] | [B, 8, 100] | model_channels=128, channel_mult=(1,2,4), attention at levels 1,2 |
+
+### Setup
+
+```bash
+cd latent-diffusion-imu
+python3 -m venv .venv
+source .venv/bin/activate
+pip install torch numpy einops omegaconf pytorch-lightning h5py pandas pyarrow Pillow pytest
+```
+
+### Usage
+
+```bash
+# 1. Preprocess HDF5 recordings into 10s windows
+python scripts/preprocess_imu.py \
+  --input_dir /path/to/hdf5s/ \
+  --output_dir /path/to/processed/ \
+  --window_sec 10 --sample_rate 200
+
+# 2. Train 1D VAE
+python scripts/train_vae_1d.py \
+  --config configs/imu/vae_1d.yaml \
+  data.params.data_dir=/path/to/processed/
+
+# 3. Train latent diffusion (after VAE converges)
+python scripts/train_ldm_1d.py \
+  --config configs/imu/ldm_1d.yaml \
+  model.params.first_stage_ckpt=/path/to/vae.ckpt \
+  data.params.data_dir=/path/to/processed/
+
+# 4. Generate IMU from trajectory (pure noise → denoise)
+python scripts/sample_imu_1d.py \
+  --config configs/imu/sample_generate.yaml \
+  --ckpt /path/to/ldm.ckpt \
+  --data_dir /path/to/processed/
+
+# 5. Sim-to-real: partial noising of synthetic IMU
+python scripts/sample_sim_to_real_1d.py \
+  --config configs/imu/sample_sim2real.yaml \
+  --ckpt /path/to/ldm.ckpt \
+  --synthetic_data /path/to/parquet \
+  --stats_path /path/to/processed/stats.pt \
+  --strengths 0.0 0.2 0.5 0.8 1.0
+```
+
+### Tests
+
+```bash
+pytest tests/test_shapes_1d.py tests/test_diffusion_1d.py -v
+```
+
+### New Files
+
+| File | Purpose |
+|------|---------|
+| `ldm/modules/diffusionmodules/model_1d.py` | Encoder1D, Decoder1D, ResnetBlock1D, AttnBlock1D, Downsample1D, Upsample1D |
+| `ldm/modules/diffusionmodules/unet_1d.py` | UNetModel1D with temporal self-attention |
+| `ldm/models/autoencoder_1d.py` | AutoencoderKL1D (KL-regularized VAE) |
+| `ldm/models/diffusion/ddpm_1d.py` | LatentDiffusion1D (training logic) |
+| `ldm/models/diffusion/ddim_1d.py` | DDIMSampler1D (inference with partial denoising) |
+| `ldm/data/imu_dataset.py` | IMUDataset, IMUDataModule, SyntheticIMUDataset |
+| `scripts/preprocess_imu.py` | HDF5 → windowed .pt cache with statistics |
+| `scripts/train_vae_1d.py` | VAE training entry point |
+| `scripts/train_ldm_1d.py` | Diffusion training entry point |
+| `scripts/sample_imu_1d.py` | Trajectory-conditioned generation |
+| `scripts/sample_sim_to_real_1d.py` | Sim-to-real partial-noising inference |
+| `configs/imu/*.yaml` | Configuration files for all stages |
+| `tests/test_shapes_1d.py` | Shape validation tests |
+| `tests/test_diffusion_1d.py` | Diffusion pipeline smoke tests |
+
+### Interpretation of Strength Parameter
+
+- `strength = 0.0` — Returns VAE reconstruction of synthetic IMU (no diffusion modification)
+- `strength = 0.2–0.5` — Preserves coarse motion while diffusion prior refines signal details
+- `strength = 0.8–1.0` — Removes most synthetic information, approaches pure trajectory-conditioned generation
+
+**Note:** This is an out-of-distribution inference experiment. The model is trained only on real IMU. Sim-to-real translation is not guaranteed.
+
+---
+
 <p align="center">
 <img src=assets/results.gif />
 </p>

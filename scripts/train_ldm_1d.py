@@ -1,0 +1,53 @@
+"""Train the 1D latent diffusion model (LatentDiffusion1D)."""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import pytorch_lightning as pl
+from omegaconf import OmegaConf
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+
+from ldm.util import instantiate_from_config
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--logdir", type=str, default="logs/ldm_1d")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", type=str, default=None)
+    args, unknown = parser.parse_known_args()
+
+    pl.seed_everything(args.seed)
+
+    config = OmegaConf.load(args.config)
+    cli = OmegaConf.from_dotlist(unknown)
+    config = OmegaConf.merge(config, cli)
+
+    model = instantiate_from_config(config.model)
+    data = instantiate_from_config(config.data)
+
+    callbacks = []
+    if "callbacks" in config.lightning:
+        for cb_cfg in config.lightning.callbacks.values():
+            callbacks.append(instantiate_from_config(cb_cfg))
+    if not any(isinstance(cb, ModelCheckpoint) for cb in callbacks):
+        callbacks.append(ModelCheckpoint(monitor="val/loss", save_top_k=3, mode="min"))
+    if not any(isinstance(cb, LearningRateMonitor) for cb in callbacks):
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
+
+    trainer_kwargs = OmegaConf.to_container(config.lightning.trainer, resolve=True)
+    trainer = pl.Trainer(
+        default_root_dir=args.logdir,
+        callbacks=callbacks,
+        **trainer_kwargs,
+    )
+
+    trainer.fit(model, datamodule=data, ckpt_path=args.resume)
+
+
+if __name__ == "__main__":
+    main()

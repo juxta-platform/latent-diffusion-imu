@@ -1,0 +1,72 @@
+model:
+  target: ldm.models.diffusion.ddpm_1d.LatentDiffusion1D
+  params:
+    timesteps: 1000
+    beta_schedule: linear
+    linear_start: 1.0e-4
+    linear_end: 2.0e-2
+    loss_type: l2
+    scale_factor: 1.0
+    scale_by_std: true
+    learning_rate: 1.0e-4
+    use_ema: true
+    monitor: val/loss
+
+    first_stage_config:
+      target: ldm.models.autoencoder_1d.AutoencoderKL1D
+      params:
+        embed_dim: 8
+        kl_weight: 1.0e-6
+        ddconfig:
+          ch: 64
+          in_channels: 6
+          out_channels: 6
+          z_channels: 8
+          ch_mult: [1, 2, 4]
+          num_res_blocks: 2
+          dropout: 0.0
+          downsample_factors: [2, 2, 5]
+          upsample_factors: [5, 2, 2]
+          double_z: true
+
+    first_stage_ckpt: ???  # path to trained VAE checkpoint
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.unet_1d.UNetModel1D
+      params:
+        in_channels: 11
+        out_channels: 8
+        model_channels: 128
+        channel_mult: [1, 2, 4]
+        num_res_blocks: 2
+        attention_levels: [1, 2]
+        dropout: 0.0
+        num_heads: 8
+
+data:
+  target: ldm.data.imu_dataset.IMUDataModule
+  params:
+    data_dir: ???  # set via CLI
+    batch_size: 32
+    num_workers: 4
+
+lightning:
+  trainer:
+    max_epochs: 1000
+    accelerator: auto
+    devices: auto
+    precision: 16-mixed
+    log_every_n_steps: 10
+    check_val_every_n_epoch: 10
+  callbacks:
+    checkpoint:
+      target: pytorch_lightning.callbacks.ModelCheckpoint
+      params:
+        monitor: val/loss
+        save_top_k: 3
+        mode: min
+        filename: "ldm1d-{epoch:03d}-{val/loss:.4f}"
+    lr_monitor:
+      target: pytorch_lightning.callbacks.LearningRateMonitor
+      params:
+        logging_interval: step

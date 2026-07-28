@@ -1,0 +1,47 @@
+model:
+  target: ldm.models.autoencoder_1d.AutoencoderKL1D
+  params:
+    embed_dim: 8
+    kl_weight: 1.0e-6
+    learning_rate: 1.0e-4
+    monitor: val/total_loss
+    input_key: imu
+    ddconfig:
+      ch: 64
+      in_channels: 6
+      out_channels: 6
+      z_channels: 8
+      ch_mult: [1, 2, 4]
+      num_res_blocks: 2
+      dropout: 0.0
+      downsample_factors: [2, 2, 5]
+      upsample_factors: [5, 2, 2]
+      double_z: true
+
+data:
+  target: ldm.data.imu_dataset.IMUDataModule
+  params:
+    data_dir: ???  # set via CLI
+    batch_size: 32
+    num_workers: 4
+
+lightning:
+  trainer:
+    max_epochs: 500
+    accelerator: auto
+    devices: auto
+    precision: 16-mixed
+    log_every_n_steps: 10
+    check_val_every_n_epoch: 5
+  callbacks:
+    checkpoint:
+      target: pytorch_lightning.callbacks.ModelCheckpoint
+      params:
+        monitor: val/total_loss
+        save_top_k: 3
+        mode: min
+        filename: "vae1d-{epoch:03d}-{val/total_loss:.4f}"
+    lr_monitor:
+      target: pytorch_lightning.callbacks.LearningRateMonitor
+      params:
+        logging_interval: step
