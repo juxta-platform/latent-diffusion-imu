@@ -2,7 +2,7 @@ model:
   target: ldm.models.autoencoder_1d.AutoencoderKL1D
   params:
     embed_dim: 8
-    kl_weight: 1.0e-6
+    kl_weight: 0.0
     learning_rate: 1.0e-4
     monitor: val/total_loss
     input_key: imu
@@ -14,8 +14,8 @@ model:
       ch_mult: [1, 2, 4]
       num_res_blocks: 2
       dropout: 0.0
-      downsample_factors: [2, 2, 5]
-      upsample_factors: [5, 2, 2]
+      downsample_factors: [2, 2, 1]
+      upsample_factors: [1, 2, 2]
       double_z: true
 
 data:

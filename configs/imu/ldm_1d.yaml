@@ -53,9 +53,8 @@ data:
 lightning:
   trainer:
     max_epochs: 1000
-    accelerator: auto
-    devices: auto
-    precision: 16-mixed
+    gpus: 1
+    precision: 16
     log_every_n_steps: 10
     check_val_every_n_epoch: 10
   callbacks:

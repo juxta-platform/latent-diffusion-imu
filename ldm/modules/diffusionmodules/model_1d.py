@@ -186,6 +186,11 @@ class Decoder1D(nn.Module):
             upsample_idx += 1
             self.up.insert(0, up)
 
+        self.post_up = nn.ModuleList([
+            ResnetBlock1D(in_channels=block_in, out_channels=block_in, dropout=dropout)
+            for _ in range(num_res_blocks)
+        ])
+
         self.norm_out = Normalize(block_in)
         self.conv_out = nn.Conv1d(block_in, out_channels, kernel_size=3, padding=1)
 
@@ -200,6 +205,9 @@ class Decoder1D(nn.Module):
             for i_block in range(self.num_res_blocks + 1):
                 h = self.up[i_level].block[i_block](h)
             h = self.up[i_level].upsample(h)
+
+        for block in self.post_up:
+            h = block(h)
 
         h = self.norm_out(h)
         h = nonlinearity(h)

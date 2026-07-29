@@ -100,7 +100,7 @@ class SyntheticIMUDataset(Dataset):
         self.vel_std = self.stats['vel_std'].view(2, 1)
 
         df = pd.read_parquet(parquet_path)
-        window_samples = window_sec * sample_rate
+        window_samples = int(window_sec * sample_rate)
 
         accel = df[['accel_local_x', 'accel_local_y', 'accel_local_z']].values
         gyro = df[['gyro_local_x', 'gyro_local_y', 'gyro_local_z']].values

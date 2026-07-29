@@ -14,8 +14,8 @@ model:
       ch_mult: [1, 2, 4]
       num_res_blocks: 2
       dropout: 0.0
-      downsample_factors: [2, 2, 5]
-      upsample_factors: [5, 2, 2]
+      downsample_factors: [2, 2, 1]
+      upsample_factors: [1, 2, 2]
       double_z: true
 
 data:

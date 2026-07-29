@@ -1,4 +1,8 @@
-"""Train the 1D IMU VAE (AutoencoderKL1D)."""
+"""Train the 1D IMU VAE (AutoencoderKL1D).
+
+Example usage:
+python scripts/train_vae_1d.py --config configs/imu/vae_1d.yaml data.params.data_dir=data/dataset_processed_overlapped
+"""
 
 import argparse
 import os
@@ -40,13 +44,15 @@ def main():
         callbacks.append(LearningRateMonitor(logging_interval="step"))
 
     trainer_kwargs = OmegaConf.to_container(config.lightning.trainer, resolve=True)
+    if args.resume:
+        trainer_kwargs["resume_from_checkpoint"] = args.resume
     trainer = pl.Trainer(
         default_root_dir=args.logdir,
         callbacks=callbacks,
         **trainer_kwargs,
     )
 
-    trainer.fit(model, datamodule=data, ckpt_path=args.resume)
+    trainer.fit(model, datamodule=data)
 
 
 if __name__ == "__main__":
