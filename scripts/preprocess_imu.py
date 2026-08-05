@@ -13,31 +13,47 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.spatial.transform import Rotation
 
 
-def load_hdf5(path):
-    """Load synced IMU data from HDF5 file."""
+def load_hdf5(path, remove_gravity=False):
+    """Load synced IMU data from HDF5 file in global frame.
+
+    Uses game_rv quaternion to rotate local accel/gyro to world frame.
+    """
     with h5py.File(path, 'r') as f:
-        acce = f['synced/acce'][:]       # [N, 3]
-        gyro = f['synced/gyro'][:]       # [N, 3]
+        acce = f['synced/acce'][:]       # [N, 3]  local frame, with gravity
+        gyro = f['synced/gyro'][:]       # [N, 3]  local frame
+        game_rv = f['synced/game_rv'][:] # [N, 4]  unit quaternion (w, x, y, z)
         pos = f['synced/tango_pos'][:]   # [N, 3]
         time = f['synced/time'][:]       # [N]
+
+        if remove_gravity:
+            acce = f['synced/linacce'][:]  # [N, 3]  local frame, gravity removed
+
+    # HDF5 stores (w, x, y, z); scipy expects (x, y, z, w)
+    rot = Rotation.from_quat(game_rv[:, [1, 2, 3, 0]])
+    acce = rot.apply(acce)   # [N, 3] global frame
+    gyro = rot.apply(gyro)   # [N, 3] global frame
+
     return acce, gyro, pos, time
 
 
-def process_file(path, window_samples, latent_length, stride=None):
+def process_file(path, window_samples, latent_length, stride=None,
+                 remove_gravity=False):
     """Process one HDF5 file into a list of window dicts.
 
     Args:
         stride: step size between consecutive windows (in samples).
                 Defaults to window_samples (non-overlapping).
+        remove_gravity: if True, use linear acceleration (no gravity).
     """
     if stride is None:
         stride = window_samples
-    acce, gyro, pos, time = load_hdf5(path)
+    acce, gyro, pos, time = load_hdf5(path, remove_gravity=remove_gravity)
 
     imu = np.concatenate([acce, gyro], axis=1)  # [N, 6]
-    pos_2d = pos[:, [0, 2]]                     # [N, 2] (x, z)
+    pos_2d = pos[:, [0, 1]]                     # [N, 2] (x, y)
 
     n_samples = len(imu)
     windows = []
@@ -104,6 +120,8 @@ def main():
     parser.add_argument('--latent_length', type=int, default=100)
     parser.add_argument('--stride_sec', type=float, default=2.0,
                         help='Stride between windows in seconds (default: 2.0, i.e. 80%% overlap with 10s window)')
+    parser.add_argument('--remove_gravity', action='store_true',
+                        help='Use linear acceleration (gravity removed) instead of raw accelerometer')
     parser.add_argument('--val_fraction', type=float, default=0.15)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
@@ -121,17 +139,24 @@ def main():
     file_windows = {}
     for fpath in hdf5_files:
         print(f'  Processing {fpath.name}...')
-        windows = process_file(str(fpath), window_samples, args.latent_length, stride=stride_samples)
+        windows = process_file(str(fpath), window_samples, args.latent_length,
+                               stride=stride_samples, remove_gravity=args.remove_gravity)
         if windows:
             file_windows[fpath.name] = windows
             print(f'    -> {len(windows)} windows')
 
-    # Split by file into train/val
+    # Split by file into train/val; never leave train empty.
     file_names = sorted(file_windows.keys())
     random.shuffle(file_names)
-    n_val = max(1, int(len(file_names) * args.val_fraction))
-    val_files = set(file_names[:n_val])
-    train_files = set(file_names[n_val:])
+    if len(file_names) == 1:
+        # Single-file / overfit: put all windows in both splits
+        train_files = set(file_names)
+        val_files = set(file_names)
+    else:
+        n_val = max(1, int(len(file_names) * args.val_fraction))
+        n_val = min(n_val, len(file_names) - 1)
+        val_files = set(file_names[:n_val])
+        train_files = set(file_names[n_val:])
 
     train_windows = [w for f in train_files for w in file_windows[f]]
     val_windows = [w for f in val_files for w in file_windows[f]]
@@ -157,6 +182,21 @@ def main():
     for i, w in enumerate(val_windows):
         torch.save(w, val_dir / f'window_{i:04d}.pt')
     torch.save(stats, output_dir / 'stats.pt')
+
+    # Write split manifest for reference (seed / split logic unchanged)
+    train_sorted = sorted(train_files)
+    val_sorted = sorted(val_files)
+    split_path = output_dir / 'split.txt'
+    with open(split_path, 'w') as f:
+        f.write(f'# seed={args.seed} val_fraction={args.val_fraction}\n')
+        f.write(f'# {len(train_sorted)} train files, {len(val_sorted)} val files\n')
+        f.write(f'\n[train]\n')
+        for name in train_sorted:
+            f.write(f'{name}\n')
+        f.write(f'\n[val]\n')
+        for name in val_sorted:
+            f.write(f'{name}\n')
+    print(f'Wrote split list to {split_path}')
 
     print(f'Saved to {output_dir}')
 

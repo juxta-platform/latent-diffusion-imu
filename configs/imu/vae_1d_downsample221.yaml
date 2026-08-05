@@ -46,3 +46,11 @@ lightning:
       target: pytorch_lightning.callbacks.LearningRateMonitor
       params:
         logging_interval: step
+    early_stopping:
+      target: pytorch_lightning.callbacks.EarlyStopping
+      params:
+        monitor: val/total_loss
+        patience: 20
+        mode: min
+        verbose: true
+        check_on_train_epoch_end: false

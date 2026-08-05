@@ -30,7 +30,9 @@ class LatentDiffusion1D(pl.LightningModule):
                  use_ema=True,
                  ):
         super().__init__()
-        self.scale_factor = scale_factor
+        # Registered buffer so scale_factor survives Lightning checkpoints
+        # (critical when scale_by_std sets it on the first training step).
+        self.register_buffer('scale_factor', torch.tensor(float(scale_factor)))
         self.scale_by_std = scale_by_std
         self.learning_rate = learning_rate
         self.loss_type = loss_type
@@ -169,13 +171,14 @@ class LatentDiffusion1D(pl.LightningModule):
         return loss
 
     def training_step(self, batch, batch_idx):
-        if self.scale_by_std and self.global_step == 0 and self.scale_factor == 1.0:
+        if self.scale_by_std and self.global_step == 0 and float(self.scale_factor) == 1.0:
             with torch.no_grad():
                 imu = batch['imu']
                 posterior = self.encode_first_stage(imu)
                 z = posterior.sample()
-                self.scale_factor = 1.0 / z.std()
-                print(f"Setting scale_factor to {self.scale_factor}")
+                # In-place update keeps the buffer on the model device and in state_dict
+                self.scale_factor.fill_(float(1.0 / z.flatten().std()))
+                print(f"Setting scale_factor to {float(self.scale_factor)}")
 
         loss = self._shared_step(batch)
         self.log("train/loss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)

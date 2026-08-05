@@ -1,4 +1,10 @@
-"""Train the 1D latent diffusion model (LatentDiffusion1D)."""
+"""Train the 1D latent diffusion model (LatentDiffusion1D).
+
+Example usage:
+python scripts/train_ldm_1d.py --config configs/imu/ldm_1d.yaml --name my_exp \
+    model.params.first_stage_ckpt=logs/vae_1d/world/checkpoints/best-394.ckpt \
+    data.params.data_dir=data/dataset_processed
+"""
 
 import argparse
 import os
@@ -8,7 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
 
 from ldm.util import instantiate_from_config
 
@@ -17,6 +24,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--logdir", type=str, default="logs/ldm_1d")
+    parser.add_argument("--name", type=str, default=None,
+                        help="Experiment name (used as log folder instead of version_N)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
     args, unknown = parser.parse_known_args()
@@ -32,12 +41,20 @@ def main():
 
     callbacks = []
     if "callbacks" in config.lightning:
-        for cb_cfg in config.lightning.callbacks.values():
+        for name, cb_cfg in config.lightning.callbacks.items():
+            if not cb_cfg.get("enabled", True):
+                print(f"Skipping disabled callback: {name}")
+                continue
             callbacks.append(instantiate_from_config(cb_cfg))
     if not any(isinstance(cb, ModelCheckpoint) for cb in callbacks):
         callbacks.append(ModelCheckpoint(monitor="val/loss", save_top_k=3, mode="min"))
     if not any(isinstance(cb, LearningRateMonitor) for cb in callbacks):
         callbacks.append(LearningRateMonitor(logging_interval="step"))
+
+    if args.name:
+        logger = TensorBoardLogger(save_dir=args.logdir, name="", version=args.name)
+    else:
+        logger = True  # default: lightning_logs/version_N
 
     trainer_kwargs = OmegaConf.to_container(config.lightning.trainer, resolve=True)
     if args.resume:
@@ -45,6 +62,7 @@ def main():
     trainer = pl.Trainer(
         default_root_dir=args.logdir,
         callbacks=callbacks,
+        logger=logger,
         **trainer_kwargs,
     )
 

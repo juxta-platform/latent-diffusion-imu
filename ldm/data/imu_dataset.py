@@ -73,7 +73,8 @@ class IMUDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=True,
+            # drop_last only when we have at least one full batch (overfit / tiny sets)
+            drop_last=len(self.train_dataset) >= self.batch_size,
         )
 
     def val_dataloader(self):
@@ -102,8 +103,8 @@ class SyntheticIMUDataset(Dataset):
         df = pd.read_parquet(parquet_path)
         window_samples = int(window_sec * sample_rate)
 
-        accel = df[['accel_local_x', 'accel_local_y', 'accel_local_z']].values
-        gyro = df[['gyro_local_x', 'gyro_local_y', 'gyro_local_z']].values
+        accel = df[['accel_world_x', 'accel_world_y', 'accel_world_z']].values
+        gyro = df[['gyro_world_x', 'gyro_world_y', 'gyro_world_z']].values
         imu = np.concatenate([accel, gyro], axis=1)  # [N, 6]
 
         vel = df[['agent_vel_x', 'agent_vel_z']].values  # [N, 2]

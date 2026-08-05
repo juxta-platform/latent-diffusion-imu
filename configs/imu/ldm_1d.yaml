@@ -52,7 +52,7 @@ data:
 
 lightning:
   trainer:
-    max_epochs: 1000
+    max_epochs: 50000
     gpus: 1
     precision: 16
     log_every_n_steps: 10
@@ -62,10 +62,21 @@ lightning:
       target: pytorch_lightning.callbacks.ModelCheckpoint
       params:
         monitor: val/loss
-        save_top_k: 3
+        save_top_k: 1
         mode: min
-        filename: "ldm1d-{epoch:03d}-{val/loss:.4f}"
+        save_last: true
+        filename: "best-{epoch:03d}"
+        auto_insert_metric_name: false
     lr_monitor:
       target: pytorch_lightning.callbacks.LearningRateMonitor
       params:
         logging_interval: step
+    early_stopping:
+      enabled: false  # set false (or CLI: lightning.callbacks.early_stopping.enabled=false) to disable
+      target: pytorch_lightning.callbacks.EarlyStopping
+      params:
+        monitor: val/loss
+        patience: 10
+        mode: min
+        verbose: true
+        check_on_train_epoch_end: false
