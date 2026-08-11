@@ -60,7 +60,8 @@ def inverse_standardize_imu(dataset, imu):
 class HDF5WindowDataset(Dataset):
     """Window a real HDF5 recording and standardize with training stats."""
 
-    def __init__(self, hdf5_path, stats_path, window_sec=10, sample_rate=200, latent_length=100):
+    def __init__(self, hdf5_path, stats_path, window_sec=10, sample_rate=200,
+                 latent_length=100, local_frame=False):
         process_file = _load_preprocess_process_file()
         self.stats = torch.load(stats_path, weights_only=True)
         self.imu_mean = self.stats["imu_mean"].view(6, 1)
@@ -68,7 +69,8 @@ class HDF5WindowDataset(Dataset):
         self.vel_mean = self.stats["vel_mean"].view(2, 1)
         self.vel_std = self.stats["vel_std"].view(2, 1)
         window_samples = int(window_sec * sample_rate)
-        self.windows = process_file(hdf5_path, window_samples, latent_length)
+        self.windows = process_file(hdf5_path, window_samples, latent_length,
+                                    local_frame=local_frame)
         if not self.windows:
             raise ValueError(f"No full windows found in {hdf5_path}")
 
@@ -124,6 +126,7 @@ def build_dataset(args):
                 window_sec=args.window_sec,
                 sample_rate=args.sample_rate,
                 latent_length=args.latent_length,
+                local_frame=getattr(args, 'local_frame', False),
             )
             source = f"hdf5:{os.path.basename(args.input)}"
         elif ext == ".parquet":
@@ -424,6 +427,8 @@ def main():
         default=None,
         help="Lightning log version dir (with events.out.tfevents.*) for training curves",
     )
+    parser.add_argument("--local_frame", action="store_true",
+                        help="Use local device-frame IMU (no rotation) for HDF5 windowing")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 

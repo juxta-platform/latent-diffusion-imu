@@ -16,41 +16,47 @@ import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 
 
-def load_hdf5(path, remove_gravity=False):
-    """Load synced IMU data from HDF5 file in global frame.
+def load_hdf5(path, remove_gravity=False, local_frame=False):
+    """Load synced IMU data from HDF5 file.
 
-    Uses game_rv quaternion to rotate local accel/gyro to world frame.
+    By default rotates local accel/gyro to world frame using game_rv quaternion.
+    With local_frame=True, returns raw device-frame IMU (no rotation).
     """
     with h5py.File(path, 'r') as f:
         acce = f['synced/acce'][:]       # [N, 3]  local frame, with gravity
         gyro = f['synced/gyro'][:]       # [N, 3]  local frame
-        game_rv = f['synced/game_rv'][:] # [N, 4]  unit quaternion (w, x, y, z)
         pos = f['synced/tango_pos'][:]   # [N, 3]
         time = f['synced/time'][:]       # [N]
 
         if remove_gravity:
             acce = f['synced/linacce'][:]  # [N, 3]  local frame, gravity removed
 
-    # HDF5 stores (w, x, y, z); scipy expects (x, y, z, w)
-    rot = Rotation.from_quat(game_rv[:, [1, 2, 3, 0]])
-    acce = rot.apply(acce)   # [N, 3] global frame
-    gyro = rot.apply(gyro)   # [N, 3] global frame
+        if not local_frame:
+            game_rv = f['synced/game_rv'][:] # [N, 4]  unit quaternion (w, x, y, z)
+
+    if not local_frame:
+        # HDF5 stores (w, x, y, z); scipy expects (x, y, z, w)
+        rot = Rotation.from_quat(game_rv[:, [1, 2, 3, 0]])
+        acce = rot.apply(acce)   # [N, 3] global frame
+        gyro = rot.apply(gyro)   # [N, 3] global frame
 
     return acce, gyro, pos, time
 
 
 def process_file(path, window_samples, latent_length, stride=None,
-                 remove_gravity=False):
+                 remove_gravity=False, local_frame=False):
     """Process one HDF5 file into a list of window dicts.
 
     Args:
         stride: step size between consecutive windows (in samples).
                 Defaults to window_samples (non-overlapping).
         remove_gravity: if True, use linear acceleration (no gravity).
+        local_frame: if True, keep raw device-frame IMU (no rotation).
     """
     if stride is None:
         stride = window_samples
-    acce, gyro, pos, time = load_hdf5(path, remove_gravity=remove_gravity)
+    acce, gyro, pos, time = load_hdf5(path, remove_gravity=remove_gravity,
+                                      local_frame=local_frame)
 
     imu = np.concatenate([acce, gyro], axis=1)  # [N, 6]
     pos_2d = pos[:, [0, 1]]                     # [N, 2] (x, y)
@@ -122,6 +128,8 @@ def main():
                         help='Stride between windows in seconds (default: 2.0, i.e. 80%% overlap with 10s window)')
     parser.add_argument('--remove_gravity', action='store_true',
                         help='Use linear acceleration (gravity removed) instead of raw accelerometer')
+    parser.add_argument('--local_frame', action='store_true',
+                        help='Keep raw device-frame IMU (no rotation to world frame)')
     parser.add_argument('--val_fraction', type=float, default=0.15)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
@@ -140,7 +148,8 @@ def main():
     for fpath in hdf5_files:
         print(f'  Processing {fpath.name}...')
         windows = process_file(str(fpath), window_samples, args.latent_length,
-                               stride=stride_samples, remove_gravity=args.remove_gravity)
+                               stride=stride_samples, remove_gravity=args.remove_gravity,
+                               local_frame=args.local_frame)
         if windows:
             file_windows[fpath.name] = windows
             print(f'    -> {len(windows)} windows')

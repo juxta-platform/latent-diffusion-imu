@@ -9,6 +9,31 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 
 
+def resolve_stats(model=None, stats_path=None, data_dir=None):
+    """Resolve IMU standardization stats.
+
+    Priority: model buffers (if stats_set) > explicit stats_path > data_dir/stats.pt.
+    Returns (imu_mean [C,1], imu_std [C,1]).
+    """
+    if model is not None and hasattr(model, 'stats_set') and bool(model.stats_set):
+        return model.imu_mean.view(-1, 1).cpu(), model.imu_std.view(-1, 1).cpu()
+
+    path = stats_path
+    if path is None and data_dir is not None:
+        candidate = os.path.join(data_dir, 'stats.pt')
+        if os.path.isfile(candidate):
+            path = candidate
+
+    if path is None:
+        raise ValueError(
+            "Cannot resolve stats: model has no embedded stats and no --stats / "
+            "--data_dir provided."
+        )
+
+    stats = torch.load(path, weights_only=True)
+    return stats['imu_mean'].view(-1, 1), stats['imu_std'].view(-1, 1)
+
+
 class IMUDataset(Dataset):
     """Dataset for preprocessed IMU windows."""
 

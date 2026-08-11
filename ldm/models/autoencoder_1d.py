@@ -29,6 +29,11 @@ class AutoencoderKL1D(pl.LightningModule):
         self.quant_conv = nn.Conv1d(2 * ddconfig["z_channels"], 2 * embed_dim, 1)
         self.post_quant_conv = nn.Conv1d(embed_dim, ddconfig["z_channels"], 1)
 
+        in_ch = ddconfig.get("in_channels", 6)
+        self.register_buffer('imu_mean', torch.zeros(in_ch))
+        self.register_buffer('imu_std', torch.ones(in_ch))
+        self.register_buffer('stats_set', torch.tensor(False))
+
         if monitor is not None:
             self.monitor = monitor
         if ckpt_path is not None:
@@ -109,6 +114,20 @@ class AutoencoderKL1D(pl.LightningModule):
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+    def set_stats(self, stats):
+        """Store IMU standardization stats so they survive in the checkpoint."""
+        self.imu_mean.copy_(stats['imu_mean'].view(-1))
+        self.imu_std.copy_(stats['imu_std'].view(-1))
+        self.stats_set.fill_(True)
+
+    def standardize(self, x):
+        """Standardize IMU input x ([B, C, T]) using embedded stats."""
+        return (x - self.imu_mean[None, :, None]) / self.imu_std[None, :, None]
+
+    def inverse_standardize(self, x):
+        """Undo standardization on x ([B, C, T])."""
+        return x * self.imu_std[None, :, None] + self.imu_mean[None, :, None]
 
     def get_last_layer(self):
         return self.decoder.conv_out.weight

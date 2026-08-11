@@ -1,9 +1,13 @@
 """Evaluate RoNIN trajectory on original vs LDM-generated IMU.
 
-Loads a single parquet or hdf5 recording, runs RoNIN inference on the
-original IMU, then generates IMU through a trained LDM (trajectory-
-conditioned DDIM in non-overlapping 10s windows) and runs RoNIN again.
-Produces side-by-side trajectory plots and ATE/RTE metrics.
+Loads a parquet/hdf5 recording (or separate IMU + conditioning sources),
+runs RoNIN on the original IMU, then generates IMU through a trained LDM
+(trajectory-conditioned DDIM in non-overlapping 10s windows) and runs
+RoNIN again. Produces side-by-side trajectory plots and ATE/RTE metrics.
+For HDF5 IMU sources, also writes a copy with synced/acce and synced/gyro
+replaced by the LDM-generated IMU (rotated back to local frame via
+game_rv). For parquet IMU sources, writes a copy with accel_world_* /
+gyro_world_* replaced by the generated world-frame IMU.
 
 Use --strength for sim-to-real style partial noising (encode input IMU,
 add noise at strength, then reverse-denoise). strength=1.0 is full
@@ -28,6 +32,17 @@ Example usage (hdf5):
         --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
         --stats data/dataset_processed_overlapped/stats.pt \
         --outdir outputs/ronin_ldm_eval
+
+Example usage (mix IMU + conditioning trajectory from different files):
+    python scripts/eval_ronin_ldm.py \
+        --imu_input data/traj_smooth_secs_0.parquet \
+        --cond_input data/dataset_full/john_right_pocket_ios_corrected.hdf5 \
+        --ldm_ckpt logs/ldm_1d/.../best-000.ckpt \
+        --first_stage_ckpt logs/vae_1d/.../best-000.ckpt \
+        --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
+        --stats data/dataset_processed_overlapped/stats.pt \
+        --strength 1.0 \
+        --outdir outputs/ronin_ldm_mixed
 """
 
 import argparse
@@ -324,6 +339,130 @@ def ldm_to_ronin_channels(feat):
 def ronin_to_ldm_channels(feat):
     """[gyro(3), accel(3)] -> [accel(3), gyro(3)]"""
     return feat[:, [3, 4, 5, 0, 1, 2]]
+
+
+def world_imu_to_local(features_ronin, game_rv):
+    """Rotate world-frame IMU back to device/local frame via game_rv.
+
+    Inverse of the local->world transform used in _HDF5Sequence.load /
+    preprocess_imu (ori * v * conj(ori)).
+
+    Args:
+        features_ronin: [N, 6] world-frame in RoNIN order [gyro, accel]
+        game_rv: [N, 4] unit quaternions (w, x, y, z)
+    Returns:
+        acce_local [N, 3], gyro_local [N, 3]
+    """
+    n = features_ronin.shape[0]
+    if game_rv.shape[0] < n:
+        raise ValueError(
+            f"game_rv length {game_rv.shape[0]} < IMU length {n}"
+        )
+    gyro_w = features_ronin[:, :3]
+    acce_w = features_ronin[:, 3:6]
+    ori_q = quaternion.from_float_array(game_rv[:n])
+    nz = np.zeros((n, 1))
+    gyro_q = quaternion.from_float_array(np.concatenate([nz, gyro_w], axis=1))
+    acce_q = quaternion.from_float_array(np.concatenate([nz, acce_w], axis=1))
+    # local = conj(ori) * world * ori
+    gyro_local = quaternion.as_float_array(ori_q.conj() * gyro_q * ori_q)[:, 1:]
+    acce_local = quaternion.as_float_array(ori_q.conj() * acce_q * ori_q)[:, 1:]
+    return acce_local, gyro_local
+
+
+def write_generated_hdf5(src_path, out_path, features_gen_ronin):
+    """Copy src HDF5 and replace synced/acce + synced/gyro with generated IMU.
+
+    features_gen_ronin is world-frame [N, 6] in RoNIN order [gyro, accel];
+    it is rotated to local frame using synced/game_rv before writing.
+    All other datasets (including linacce) are left unchanged. Trailing
+    samples beyond N keep the original local IMU.
+    """
+    import shutil
+
+    src_path = src_path if src_path.endswith((".hdf5", ".h5")) else src_path + ".hdf5"
+    N = features_gen_ronin.shape[0]
+
+    shutil.copy2(src_path, out_path)
+    with h5py.File(out_path, "a") as f:
+        if "synced" not in f or "game_rv" not in f["synced"]:
+            raise ValueError(f"{src_path} missing synced/game_rv; cannot convert to local")
+        game_rv = np.copy(f["synced/game_rv"][:]).astype(np.float64)
+        n_file = f["synced/acce"].shape[0]
+        n_write = min(N, n_file, game_rv.shape[0])
+        if n_write < N:
+            print(f"  [warn] Truncating generated IMU {N} -> {n_write} to fit HDF5 length")
+
+        acce_local, gyro_local = world_imu_to_local(
+            features_gen_ronin[:n_write], game_rv[:n_write]
+        )
+        f["synced/acce"][:n_write] = acce_local
+        f["synced/gyro"][:n_write] = gyro_local
+        # Leave linacce / others as original (local-frame source data)
+
+    print(f"Wrote generated local-frame IMU HDF5 to {out_path} "
+          f"({n_write}/{n_file} samples replaced)")
+    return out_path
+
+
+def write_generated_parquet(src_path, out_path, features_gen_ronin, gen_ts):
+    """Copy src parquet and replace world-frame IMU columns with generated IMU.
+
+    features_gen_ronin is world-frame [N, 6] in RoNIN order [gyro, accel],
+    sampled on gen_ts. Values are written onto the (deduped) parquet time grid
+    via linear interpolation when the grids differ (e.g. after 200 Hz resample).
+    Local IMU columns and all other fields are left unchanged.
+    """
+    src_path = src_path if src_path.endswith(".parquet") else src_path + ".parquet"
+    df = pd.read_parquet(src_path)
+    df = df.drop_duplicates(subset="time", keep="first").reset_index(drop=True)
+    t_df = df["time"].values.astype(np.float64)
+    gen_ts = np.asarray(gen_ts, dtype=np.float64)
+    N = features_gen_ronin.shape[0]
+    gen_ts = gen_ts[:N]
+    gyro_gen = features_gen_ronin[:N, :3]
+    accel_gen = features_gen_ronin[:N, 3:6]
+
+    same_grid = (
+        len(gen_ts) == len(t_df)
+        and np.allclose(gen_ts, t_df, atol=1e-4, rtol=0.0)
+    )
+    if same_grid:
+        gyro_out, accel_out = gyro_gen, accel_gen
+    else:
+        print(f"  [info] Interpolating generated IMU ({N} @ gen_ts) onto "
+              f"parquet time grid ({len(t_df)} samples)")
+        # Only fill where parquet time falls inside the generated span
+        gyro_out = np.column_stack([
+            np.interp(t_df, gen_ts, gyro_gen[:, d], left=np.nan, right=np.nan)
+            for d in range(3)
+        ])
+        accel_out = np.column_stack([
+            np.interp(t_df, gen_ts, accel_gen[:, d], left=np.nan, right=np.nan)
+            for d in range(3)
+        ])
+        # Keep original IMU outside the generated span
+        mask = np.isfinite(gyro_out[:, 0])
+        for d, col in enumerate(["gyro_world_x", "gyro_world_y", "gyro_world_z"]):
+            vals = df[col].values.astype(np.float64)
+            vals[mask] = gyro_out[mask, d]
+            gyro_out[:, d] = vals
+        for d, col in enumerate(["accel_world_x", "accel_world_y", "accel_world_z"]):
+            vals = df[col].values.astype(np.float64)
+            vals[mask] = accel_out[mask, d]
+            accel_out[:, d] = vals
+
+    df = df.copy()
+    df["gyro_world_x"] = gyro_out[:, 0]
+    df["gyro_world_y"] = gyro_out[:, 1]
+    df["gyro_world_z"] = gyro_out[:, 2]
+    df["accel_world_x"] = accel_out[:, 0]
+    df["accel_world_y"] = accel_out[:, 1]
+    df["accel_world_z"] = accel_out[:, 2]
+    df.to_parquet(out_path, index=False)
+    print(f"Wrote generated world-frame IMU parquet to {out_path} "
+          f"({N} gen samples -> {len(df)} rows)")
+    return out_path
 
 
 def _window_conditioning(ts, gt_pos, start, end, vel_mean, vel_std, device):
@@ -629,6 +768,120 @@ def plot_imu_windows(feat_orig, feat_gen, outdir, n_plot=4):
 
 
 # ---------------------------------------------------------------------------
+# Data loading helpers
+# ---------------------------------------------------------------------------
+
+def detect_dataset_type(path, override=None):
+    """Return 'sim_parquet' or 'hybrid' from path extension or override."""
+    if override is not None:
+        return override
+    ext = osp.splitext(path)[1].lower()
+    if ext == ".parquet":
+        return "sim_parquet"
+    if ext in (".hdf5", ".h5"):
+        return "hybrid"
+    raise ValueError(
+        f"Cannot auto-detect dataset type for {path}. "
+        f"Pass --dataset / --imu_dataset / --cond_dataset."
+    )
+
+
+def split_input_path(path):
+    """Return (root_dir, data_name_without_ext, resolved_path_with_ext)."""
+    path = path.rstrip("/")
+    root_dir = osp.split(path)[0]
+    data_name = osp.split(path)[1]
+    resolved = path
+    for suffix in (".parquet", ".hdf5", ".h5"):
+        if data_name.endswith(suffix):
+            data_name = data_name[:-len(suffix)]
+            break
+    else:
+        # No extension on the provided path; leave data_name as-is (loaders append).
+        pass
+    return root_dir, data_name, resolved
+
+
+def load_strided_dataset(path, dataset_type, step_size, window_size):
+    """Load a single recording into a _StridedDataset."""
+    root_dir, data_name, _ = split_input_path(path)
+    seq_type = _ParquetSequence if dataset_type == "sim_parquet" else _HDF5Sequence
+    return _StridedDataset(
+        seq_type, root_dir, [data_name],
+        step_size=step_size, window_size=window_size,
+    )
+
+
+def align_imu_and_cond(imu_ds, cond_ds, trim=False):
+    """Take IMU features from imu_ds and traj conditioning from cond_ds.
+
+    Requires equal sample counts unless trim=True (then truncate both to min).
+    Returns (features, ts_cond, gt_pos_cond, ts_imu, n_samples) and mutates
+    imu_ds so RoNIN GT / timestamps come from the conditioning trajectory.
+    """
+    features = np.asarray(imu_ds.features[0])
+    ts_imu = np.asarray(imu_ds.ts_full[0], dtype=np.float64).copy()
+    ts_cond = np.asarray(cond_ds.ts_full[0], dtype=np.float64)
+    gt_cond = np.asarray(cond_ds.gt_pos_full[0], dtype=np.float64)
+
+    n_imu = features.shape[0]
+    n_cond = min(len(ts_cond), len(gt_cond))
+    if n_imu != n_cond:
+        if not trim:
+            raise ValueError(
+                f"IMU and conditioning lengths must match: "
+                f"IMU features={n_imu} ({n_imu / SAMPLE_RATE:.2f}s), "
+                f"cond traj={n_cond} ({n_cond / SAMPLE_RATE:.2f}s). "
+                f"Pass --trim_to_match to truncate to the shorter length, "
+                f"or trim/resample sources beforehand."
+            )
+        N = min(n_imu, n_cond)
+        print(f"  [trim] Truncating to common length {N} samples "
+              f"({N / SAMPLE_RATE:.2f}s); IMU was {n_imu}, cond was {n_cond}")
+    else:
+        N = n_imu
+
+    features = features[:N]
+    ts_imu = ts_imu[:N]
+    ts = ts_cond[:N]
+    gt_pos = gt_cond[:N]
+
+    # Point RoNIN evaluation GT at the conditioning trajectory
+    imu_ds.features[0] = features
+    imu_ds.ts_full[0] = ts
+    imu_ds.gt_pos_full[0] = gt_pos
+
+    n_ronin_ts = min(len(imu_ds.ts[0]), N)
+    n_ronin_pos = min(len(imu_ds.gt_pos[0]), N)
+    imu_ds.ts[0] = ts[:n_ronin_ts]
+    pos_cols = imu_ds.gt_pos[0].shape[1]
+    if gt_pos.shape[1] >= pos_cols:
+        imu_ds.gt_pos[0] = gt_pos[:n_ronin_pos, :pos_cols]
+    else:
+        pad = np.zeros((n_ronin_pos, pos_cols), dtype=gt_pos.dtype)
+        pad[:, :gt_pos.shape[1]] = gt_pos[:n_ronin_pos]
+        imu_ds.gt_pos[0] = pad
+
+    if len(imu_ds.orientations) > 0:
+        imu_ds.orientations[0] = imu_ds.orientations[0][:n_ronin_ts]
+    if len(imu_ds.targets) > 0:
+        # Keep targets whose RoNIN window still fits in the truncated features
+        max_start = max(0, N - imu_ds.window_size)
+        imu_ds.targets[0] = imu_ds.targets[0][: max_start + 1]
+
+    # Drop RoNIN windows that would read past the truncated feature length
+    imu_ds.index_map = [
+        [seq_id, frame_id]
+        for seq_id, frame_id in imu_ds.index_map
+        if seq_id == 0
+        and frame_id + imu_ds.window_size <= N
+        and frame_id < len(imu_ds.targets[0])
+    ]
+
+    return features, ts, gt_pos, ts_imu, N
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -636,8 +889,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate RoNIN trajectory on original vs LDM-generated IMU"
     )
-    parser.add_argument("--input", type=str, required=True,
-                        help="Path to .parquet or .hdf5 input file")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Path to .parquet or .hdf5 (used for both IMU and "
+                             "conditioning unless --imu_input / --cond_input set)")
+    parser.add_argument("--imu_input", type=str, default=None,
+                        help="IMU source (.parquet or .hdf5). Defaults to --input")
+    parser.add_argument("--cond_input", type=str, default=None,
+                        help="Conditioning trajectory source (.parquet or .hdf5). "
+                             "Defaults to --input. Length must match --imu_input "
+                             "unless --trim_to_match is set")
+    parser.add_argument("--trim_to_match", action="store_true",
+                        help="If IMU and cond lengths differ, truncate both to the "
+                             "shorter length (prefix) instead of erroring")
     parser.add_argument("--ldm_config", "--config", type=str,
                         default="configs/imu/ldm_1d.yaml",
                         help="LDM model config (must match the checkpoint architecture)")
@@ -648,7 +911,11 @@ def main():
     parser.add_argument("--stats", type=str, required=True, help="Path to stats.pt")
     parser.add_argument("--outdir", type=str, default="outputs/ronin_ldm_eval")
     parser.add_argument("--dataset", type=str, default=None,
-                        help="Override dataset type (sim_parquet / hybrid). Auto-detected from extension.")
+                        help="Override dataset type for --input (sim_parquet / hybrid)")
+    parser.add_argument("--imu_dataset", type=str, default=None,
+                        help="Override dataset type for --imu_input")
+    parser.add_argument("--cond_dataset", type=str, default=None,
+                        help="Override dataset type for --cond_input")
     parser.add_argument("--use_3d", action="store_true",
                         help="Use 3D RoNIN model (ronin_resnet_3d) instead of 2D")
     parser.add_argument("--arch", type=str, default="resnet18")
@@ -673,25 +940,53 @@ def main():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--n_imu_plot", type=int, default=4,
                         help="Number of IMU window overlay plots")
+    parser.add_argument(
+        "--hdf5_out",
+        type=str,
+        default=None,
+        help="Output path for HDF5 with generated local-frame IMU "
+             "(default: <outdir>/<imu_stem>_ldm_gen.hdf5). "
+             "Only written when IMU source is HDF5. Pass empty string to disable.",
+    )
+    parser.add_argument(
+        "--parquet_out",
+        type=str,
+        default=None,
+        help="Output path for parquet with generated world-frame IMU "
+             "(default: <outdir>/<imu_stem>_ldm_gen.parquet). "
+             "Only written when IMU source is parquet. Pass empty string to disable.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    imu_path = args.imu_input or args.input
+    cond_path = args.cond_input or args.input
+    if imu_path is None or cond_path is None:
+        raise ValueError(
+            "Provide --input, or both --imu_input and --cond_input "
+            "(each defaults to --input when omitted)"
+        )
 
     torch.manual_seed(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
-    ext = osp.splitext(args.input)[1].lower()
+    # Legacy --dataset applies to --input when used as the shared source
+    imu_override = args.imu_dataset
+    cond_override = args.cond_dataset
     if args.dataset is not None:
-        dataset_type = args.dataset
-    elif ext == ".parquet":
-        dataset_type = "sim_parquet"
-    elif ext in (".hdf5", ".h5"):
-        dataset_type = "hybrid"
-    else:
-        raise ValueError(f"Cannot auto-detect dataset type for {ext}. Use --dataset.")
+        if args.imu_input is None and imu_override is None:
+            imu_override = args.dataset
+        if args.cond_input is None and cond_override is None:
+            cond_override = args.dataset
 
-    print(f"Input:   {args.input}")
-    print(f"Dataset: {dataset_type}")
+    imu_type = detect_dataset_type(imu_path, imu_override)
+    cond_type = detect_dataset_type(cond_path, cond_override)
+    mixed = osp.abspath(imu_path) != osp.abspath(cond_path)
+
+    print(f"IMU source:  {imu_path} ({imu_type})")
+    print(f"Cond source: {cond_path} ({cond_type})"
+          + ("  [mixed]" if mixed else "  [same as IMU]"))
     print(f"Device:  {device}")
     print(f"Strength:{args.strength}")
 
@@ -719,31 +1014,32 @@ def main():
 
     # ---- Load data ----
     print("Loading data ...")
-    input_path = args.input.rstrip("/")
-    root_dir = osp.split(input_path)[0]
-    data_name = osp.split(input_path)[1]
-    for suffix in (".parquet", ".hdf5", ".h5"):
-        if data_name.endswith(suffix):
-            data_name = data_name[:-len(suffix)]
-            break
-
-    if dataset_type == "sim_parquet":
-        seq_type = _ParquetSequence
-    else:
-        seq_type = _HDF5Sequence
-
-    dataset_orig = _StridedDataset(
-        seq_type, root_dir, [data_name],
-        step_size=args.step_size, window_size=args.window_size,
+    imu_ds = load_strided_dataset(
+        imu_path, imu_type, args.step_size, args.window_size
     )
-    features_orig = dataset_orig.features[0]
-    ts = dataset_orig.ts_full[0]
-    gt_pos = dataset_orig.gt_pos_full[0]
-    N = min(features_orig.shape[0], len(ts), len(gt_pos))
-    if N < features_orig.shape[0]:
-        print(f"  [info] Truncating features {features_orig.shape[0]} -> {N} to match ts/gt_pos")
-        features_orig = features_orig[:N]
-        dataset_orig.features[0] = features_orig
+    if mixed:
+        cond_ds = load_strided_dataset(
+            cond_path, cond_type, args.step_size, args.window_size
+        )
+        features_orig, ts, gt_pos, ts_imu, N = align_imu_and_cond(
+            imu_ds, cond_ds, trim=args.trim_to_match
+        )
+        dataset_orig = imu_ds
+    else:
+        dataset_orig = imu_ds
+        features_orig = dataset_orig.features[0]
+        ts = dataset_orig.ts_full[0]
+        gt_pos = dataset_orig.gt_pos_full[0]
+        N = min(features_orig.shape[0], len(ts), len(gt_pos))
+        if N < features_orig.shape[0]:
+            print(f"  [info] Truncating features {features_orig.shape[0]} -> {N} "
+                  f"to match ts/gt_pos")
+            features_orig = features_orig[:N]
+            dataset_orig.features[0] = features_orig
+            ts = ts[:N]
+            gt_pos = gt_pos[:N]
+        ts_imu = ts
+
     n_ldm_windows = N // LDM_WINDOW
     print(f"  {N} samples ({N / SAMPLE_RATE:.1f}s), {n_ldm_windows} full 10s LDM windows, "
           f"{len(dataset_orig)} RoNIN windows")
@@ -781,8 +1077,12 @@ def main():
 
     # ---- Metrics ----
     metrics = {
-        "input": osp.abspath(args.input),
-        "dataset_type": dataset_type,
+        "imu_input": osp.abspath(imu_path),
+        "cond_input": osp.abspath(cond_path),
+        "mixed": mixed,
+        "trim_to_match": bool(args.trim_to_match),
+        "imu_dataset_type": imu_type,
+        "cond_dataset_type": cond_type,
         "ldm_ckpt": osp.abspath(args.ldm_ckpt),
         "first_stage_ckpt": osp.abspath(args.first_stage_ckpt),
         "ronin_ckpt": osp.abspath(args.ronin_ckpt),
@@ -809,6 +1109,31 @@ def main():
     plot_trajectories(res_orig, res_gen, args.outdir, use_3d=args.use_3d)
     plot_position_error(res_orig, res_gen, args.outdir)
     plot_imu_windows(features_orig, features_gen, args.outdir, n_plot=args.n_imu_plot)
+
+    # ---- Export generated IMU into the IMU-source file format ----
+    stem = osp.splitext(osp.basename(imu_path.rstrip("/")))[0]
+    if imu_type != "sim_parquet" and args.hdf5_out != "":
+        if args.hdf5_out is None:
+            hdf5_out = osp.join(args.outdir, f"{stem}_ldm_gen.hdf5")
+        else:
+            hdf5_out = args.hdf5_out
+        print("\nWriting generated IMU HDF5 (world -> local via game_rv) ...")
+        src_hdf5 = imu_path if imu_path.endswith((".hdf5", ".h5")) else imu_path + ".hdf5"
+        write_generated_hdf5(src_hdf5, hdf5_out, features_gen)
+        metrics["hdf5_out"] = osp.abspath(hdf5_out)
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+    elif imu_type == "sim_parquet" and args.parquet_out != "":
+        if args.parquet_out is None:
+            parquet_out = osp.join(args.outdir, f"{stem}_ldm_gen.parquet")
+        else:
+            parquet_out = args.parquet_out
+        print("\nWriting generated IMU parquet (world-frame columns) ...")
+        src_pq = imu_path if imu_path.endswith(".parquet") else imu_path + ".parquet"
+        write_generated_parquet(src_pq, parquet_out, features_gen, ts_imu[: features_gen.shape[0]])
+        metrics["parquet_out"] = osp.abspath(parquet_out)
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
 
     print(f"\nDone. Results in {args.outdir}")
 

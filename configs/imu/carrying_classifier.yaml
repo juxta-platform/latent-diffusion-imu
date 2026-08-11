@@ -1,0 +1,32 @@
+# Carrying-type classifier config (reference / reproducibility).
+# The training script uses CLI args directly, but this documents defaults.
+
+classifier:
+  in_dim: 800           # 8 (embed_dim) * 100 (latent_length)
+  hidden: [256, 128]
+  n_classes: 4
+  dropout: 0.2
+  class_names: [chest, demo_hand, pocket, swinging]
+
+vae:
+  config: configs/imu/vae_1d.yaml
+  # Local-frame checkpoint (decoder_fix_more_data):
+  ckpt: logs/vae_1d/lightning_logs/decoder_fix_more_data/checkpoints/vae1d-epoch=250-val/total_loss=0.0116.ckpt
+  # Local-frame stats (if ckpt doesn't embed them):
+  stats: data/dataset_processed_overlapped/stats.pt
+
+data:
+  data_dir: data/real_data_by_carrying_type
+  window_sec: 10.0
+  sample_rate: 200
+  latent_length: 100
+  stride_sec: 2.0        # 80% overlap for training windows
+  val_fraction: 0.2
+  imu_frame: local       # local (device) or world (HDF5 via game_rv)
+
+training:
+  epochs: 100
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  seed: 42

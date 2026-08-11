@@ -29,7 +29,7 @@ import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
-from ldm.data.imu_dataset import IMUDataset, SyntheticIMUDataset
+from ldm.data.imu_dataset import IMUDataset, SyntheticIMUDataset, resolve_stats
 from ldm.util import instantiate_from_config
 
 CHANNEL_NAMES = ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]
@@ -53,13 +53,15 @@ def inverse_standardize_imu(dataset, imu):
 class HDF5WindowDataset(Dataset):
     """Window a real HDF5 recording and standardize with training stats."""
 
-    def __init__(self, hdf5_path, stats_path, window_sec=10, sample_rate=200, latent_length=100):
+    def __init__(self, hdf5_path, stats_path, window_sec=10, sample_rate=200,
+                 latent_length=100, local_frame=False):
         process_file = _load_preprocess_process_file()
         self.stats = torch.load(stats_path, weights_only=True)
         self.imu_mean = self.stats["imu_mean"].view(6, 1)
         self.imu_std = self.stats["imu_std"].view(6, 1)
         window_samples = int(window_sec * sample_rate)
-        self.windows = process_file(hdf5_path, window_samples, latent_length)
+        self.windows = process_file(hdf5_path, window_samples, latent_length,
+                                    local_frame=local_frame)
         if not self.windows:
             raise ValueError(f"No full windows found in {hdf5_path}")
 
@@ -88,20 +90,38 @@ def load_model(config_path, ckpt_path, device):
     return model, config
 
 
-def resolve_stats_path(stats, data_dir):
+def resolve_stats_path(stats, data_dir, model=None):
+    """Resolve stats.pt path; falls back to model-embedded stats if available."""
     if stats is not None:
         return stats
     if data_dir is not None:
         path = os.path.join(data_dir, "stats.pt")
         if os.path.isfile(path):
             return path
-    raise ValueError("Provide --stats or --data_dir containing stats.pt")
+    if model is not None and hasattr(model, 'stats_set') and bool(model.stats_set):
+        return None  # signal caller to use model-embedded stats
+    raise ValueError("Provide --stats or --data_dir containing stats.pt (or use a ckpt with embedded stats)")
 
 
-def build_dataset(args):
+def _stats_path_or_model(args, model=None):
+    """Get stats_path; returns None when model-embedded stats should be used."""
+    return resolve_stats_path(args.stats, args.data_dir, model=model)
+
+
+def build_dataset(args, model=None):
     """Build dataset from --input (hdf5/parquet) or preprocessed --data_dir/--split."""
+    stats_path = _stats_path_or_model(args, model=model)
+    local_frame = getattr(args, 'local_frame', False)
+
+    if stats_path is None:
+        imu_mean, imu_std = resolve_stats(model=model)
+        tmp_stats = {'imu_mean': imu_mean.view(-1), 'imu_std': imu_std.view(-1),
+                     'vel_mean': torch.zeros(2), 'vel_std': torch.ones(2)}
+        tmp_path = os.path.join(args.outdir, '_tmp_stats.pt')
+        torch.save(tmp_stats, tmp_path)
+        stats_path = tmp_path
+
     if args.input is not None:
-        stats_path = resolve_stats_path(args.stats, args.data_dir)
         ext = os.path.splitext(args.input)[1].lower()
         if ext in (".hdf5", ".h5"):
             dataset = HDF5WindowDataset(
@@ -110,6 +130,7 @@ def build_dataset(args):
                 window_sec=args.window_sec,
                 sample_rate=args.sample_rate,
                 latent_length=args.latent_length,
+                local_frame=local_frame,
             )
             source = f"hdf5:{os.path.basename(args.input)}"
         elif ext == ".parquet":
@@ -128,7 +149,6 @@ def build_dataset(args):
     if args.data_dir is None:
         raise ValueError("Provide --data_dir (preprocessed) or --input (hdf5/parquet)")
 
-    stats_path = resolve_stats_path(args.stats, args.data_dir)
     dataset = IMUDataset(args.data_dir, stats_path, split=args.split)
     source = f"split:{args.split}"
     return dataset, source
@@ -323,6 +343,8 @@ def main():
         default=None,
         help="Lightning log version dir (with events.out.tfevents.*) for training curves",
     )
+    parser.add_argument("--local_frame", action="store_true",
+                        help="Use local device-frame IMU (no rotation) for HDF5 windowing")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -334,7 +356,7 @@ def main():
     kl_weight = float(getattr(model, "kl_weight", config.model.params.get("kl_weight", 1e-6)))
     use_posterior_mean = not args.sample_posterior
 
-    dataset, source = build_dataset(args)
+    dataset, source = build_dataset(args, model=model)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

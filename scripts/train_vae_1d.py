@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import torch
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
@@ -36,6 +37,15 @@ def main():
 
     model = instantiate_from_config(config.model)
     data = instantiate_from_config(config.data)
+
+    # Embed standardization stats into the model so they survive in checkpoints
+    data_dir = OmegaConf.to_container(config.data.params, resolve=True).get("data_dir")
+    if data_dir is not None:
+        stats_path = os.path.join(data_dir, "stats.pt")
+        if os.path.isfile(stats_path):
+            stats = torch.load(stats_path, weights_only=True)
+            model.set_stats(stats)
+            print(f"Embedded IMU stats from {stats_path} into model buffers")
 
     callbacks = []
     if "callbacks" in config.lightning:
