@@ -420,10 +420,9 @@ def eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_name
 
         conf = float(_softmax(logits_np)[pred])
         pred_label = f"{class_names[pred]} ({conf:.2f})"
-        if args.n_plot < 0 or i < args.n_plot:
-            plot_imu_window(w_imu.numpy(), plot_dir, i,
-                            gt_label="N/A", pred_label=pred_label,
-                            sample_rate=SAMPLE_RATE, time_offset=time_offset)
+        plot_imu_window(w_imu.numpy(), plot_dir, i,
+                        gt_label="N/A", pred_label=pred_label,
+                        sample_rate=SAMPLE_RATE, time_offset=time_offset)
 
     all_logits = np.stack(all_logits, axis=0)
     plot_timeline(predictions, class_names, args.outdir,
@@ -452,8 +451,7 @@ def eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_name
     with open(os.path.join(args.outdir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    n_plotted = n_windows if args.n_plot < 0 else min(args.n_plot, n_windows)
-    print(f"Saved {n_plotted} window plots to {plot_dir}")
+    print(f"Saved {n_windows} window plots to {plot_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +569,8 @@ def main():
     parser.add_argument("--stats", type=str, default=None)
     parser.add_argument("--outdir", type=str, default="outputs/carrying_eval")
     parser.add_argument("--n_plot", type=int, default=8,
-                        help="Number of window plots (-1 = all)")
+                        help="Labeled-split: number of window plots (-1 = all). "
+                             "Single-trajectory always plots every timeline window.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--stride_sec", type=float, default=2.0)

@@ -1,48 +1,27 @@
-"""Evaluate RoNIN trajectory on original vs LDM-generated IMU.
+"""Evaluate RoNIN trajectory on original vs sim-conditioned LDM-generated IMU.
 
-Loads a parquet/hdf5 recording (or separate IMU + conditioning sources),
-runs RoNIN on the original IMU, then generates IMU through a trained LDM
-(trajectory-conditioned DDIM in non-overlapping 10s windows) and runs
-RoNIN again. Produces side-by-side trajectory plots and ATE/RTE metrics.
-For HDF5 IMU sources, also writes a copy with synced/acce and synced/gyro
-replaced by the LDM-generated IMU (rotated back to local frame via
-game_rv). For parquet IMU sources, writes a copy with accel_world_* /
-gyro_world_* replaced by the generated world-frame IMU.
+Same features as eval_ronin_ldm.py, but the LDM is additionally conditioned on
+a VAE-encoded synthetic IMU latent (alongside trajectory). Requires a paired
+synthetic IMU source (--sim_input or --pair_dir).
 
-Use --strength for sim-to-real style partial noising (encode input IMU,
-add noise at strength, then reverse-denoise). strength=1.0 is full
-generation from noise (default); strength=0.0 is VAE reconstruction only.
-
-Example usage (parquet, partial noise):
-    python scripts/eval_ronin_ldm.py \
-        --input data/smplx_data_gen_0000.parquet \
-        --ldm_ckpt logs/ldm_1d/.../best-000.ckpt \
+Example usage (pair folder):
+    python scripts/eval_ronin_ldm_sim_cond.py \
+        --pair_dir data/real_sim_imu_pairs/chest/john_chest_ios_corrected \
+        --ldm_ckpt logs/ldm_1d_sim_cond/.../best-000.ckpt \
         --first_stage_ckpt logs/vae_1d/.../best-000.ckpt \
         --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
-        --stats data/dataset_processed_overlapped/stats.pt \
-        --strength 0.5 \
-        --outdir outputs/ronin_ldm_eval
+        --stats data/real_sim_pairs_processed/stats.pt \
+        --outdir outputs/ronin_ldm_sim_cond_eval
 
-Example usage (hdf5):
-    python scripts/eval_ronin_ldm.py \
-        --input data/dataset/john_chest_ios_corrected.hdf5 \
-        --dataset hybrid \
-        --ldm_ckpt logs/ldm_1d/.../best-000.ckpt \
+Example usage (explicit paths):
+    python scripts/eval_ronin_ldm_sim_cond.py \
+        --imu_input data/real_sim_imu_pairs/chest/john_chest_ios_corrected/real.hdf5 \
+        --sim_input data/real_sim_imu_pairs/chest/john_chest_ios_corrected/synthetic.parquet \
+        --ldm_ckpt logs/ldm_1d_sim_cond/.../best-000.ckpt \
         --first_stage_ckpt logs/vae_1d/.../best-000.ckpt \
         --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
-        --stats data/dataset_processed_overlapped/stats.pt \
-        --outdir outputs/ronin_ldm_eval
-
-Example usage (mix IMU + conditioning trajectory from different files):
-    python scripts/eval_ronin_ldm.py \
-        --imu_input data/traj_smooth_secs_0.parquet \
-        --cond_input data/dataset_full/john_right_pocket_ios_corrected.hdf5 \
-        --ldm_ckpt logs/ldm_1d/.../best-000.ckpt \
-        --first_stage_ckpt logs/vae_1d/.../best-000.ckpt \
-        --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
-        --stats data/dataset_processed_overlapped/stats.pt \
-        --strength 1.0 \
-        --outdir outputs/ronin_ldm_mixed
+        --stats data/real_sim_pairs_processed/stats.pt \
+        --outdir outputs/ronin_ldm_sim_cond_eval
 """
 
 import argparse
@@ -494,6 +473,21 @@ def _window_conditioning(ts, gt_pos, start, end, vel_mean, vel_std, device):
     return {"velocity": velocity, "physical_time": physical_time}
 
 
+def load_sim_imu_ldm(path, n_samples=None):
+    """Load synthetic parquet world-frame IMU in LDM channel order [accel, gyro].
+
+    Returns numpy [N, 6].
+    """
+    path = path if path.endswith(".parquet") else path + ".parquet"
+    df = pd.read_parquet(path)
+    accel = df[["accel_world_x", "accel_world_y", "accel_world_z"]].values.astype(np.float64)
+    gyro = df[["gyro_world_x", "gyro_world_y", "gyro_world_z"]].values.astype(np.float64)
+    imu = np.concatenate([accel, gyro], axis=1)  # [N, 6] LDM order
+    if n_samples is not None:
+        imu = imu[:n_samples]
+    return imu
+
+
 @torch.no_grad()
 def generate_features_ldm(
     features,
@@ -506,17 +500,19 @@ def generate_features_ldm(
     vel_mean,
     vel_std,
     device,
+    sim_features_ldm,
     ddim_steps=50,
     ddim_eta=0.0,
     use_ema=True,
     strength=1.0,
 ):
-    """Generate IMU via LDM in non-overlapping 10s windows.
+    """Generate IMU via sim-conditioned LDM in non-overlapping 10s windows.
 
     Args:
         features: numpy [N, 6] in RoNIN channel order [gyro, accel]
         ts: numpy [N] timestamps aligned with features/gt_pos
         gt_pos: numpy [N, 2|3] ground-truth position
+        sim_features_ldm: numpy [N, 6] sim IMU in LDM order [accel, gyro]
         strength: 0 = VAE recon of input IMU; (0,1) = encode + partial
             DDIM denoising (img2img); >=1 = full generation from noise.
     Returns:
@@ -524,8 +520,14 @@ def generate_features_ldm(
     """
     if not (0.0 <= strength):
         raise ValueError(f"strength must be >= 0, got {strength}")
+    if sim_features_ldm is None:
+        raise ValueError("sim_features_ldm is required for sim-conditioned LDM")
 
     N = features.shape[0]
+    if sim_features_ldm.shape[0] < N:
+        raise ValueError(
+            f"sim IMU length {sim_features_ldm.shape[0]} < features length {N}"
+        )
     n_windows = N // LDM_WINDOW
     gen = features.copy()
 
@@ -547,12 +549,18 @@ def generate_features_ldm(
         for i in range(n_windows):
             s, e = i * LDM_WINDOW, (i + 1) * LDM_WINDOW
             # Align conditioning length with available ts/gt_pos
-            n_cond = min(e, len(ts), len(gt_pos))
+            n_cond = min(e, len(ts), len(gt_pos), sim_features_ldm.shape[0])
             if n_cond - s < LDM_WINDOW:
                 print(f"  [warn] Window {i} truncated for conditioning; keeping original IMU")
                 continue
 
             cond = _window_conditioning(ts, gt_pos, s, e, vel_mean_d, vel_std_d, device)
+
+            # Encode sim IMU window as additional conditioning
+            sim_win = torch.tensor(sim_features_ldm[s:e].T, dtype=torch.float32).unsqueeze(0).to(device)
+            sim_norm = (sim_win - mean_d) / std_d
+            sim_latent = model.scale_factor * model.encode_first_stage(sim_norm).mode()
+            cond["sim_latent"] = sim_latent
 
             if strength < 1.0:
                 # Encode input window (RoNIN [gyro,accel] -> LDM [accel,gyro])
@@ -711,7 +719,7 @@ def plot_trajectories(res_orig, res_recon, outdir, use_3d=False):
     ax.set_title("Overlay")
     ax.legend(fontsize=8); ax.set_aspect("equal"); ax.grid(True, alpha=0.25)
 
-    fig.suptitle("RoNIN trajectory: Original vs LDM-generated IMU", fontsize=13)
+    fig.suptitle("RoNIN trajectory: Original vs sim-cond LDM-generated IMU", fontsize=13)
     fig.tight_layout()
     path = osp.join(outdir, "trajectory_comparison.png")
     fig.savefig(path, dpi=150)
@@ -892,29 +900,35 @@ def align_imu_and_cond(imu_ds, cond_ds, trim=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate RoNIN trajectory on original vs LDM-generated IMU"
+        description="Evaluate RoNIN on original vs sim-conditioned LDM-generated IMU"
     )
+    parser.add_argument("--pair_dir", type=str, default=None,
+                        help="Pair folder with real.hdf5 + synthetic.parquet "
+                             "(sets imu/cond to real.hdf5 and sim to synthetic.parquet)")
     parser.add_argument("--input", type=str, default=None,
                         help="Path to .parquet or .hdf5 (used for both IMU and "
-                             "conditioning unless --imu_input / --cond_input set)")
+                             "trajectory conditioning unless --imu_input / --cond_input set)")
     parser.add_argument("--imu_input", type=str, default=None,
                         help="IMU source (.parquet or .hdf5). Defaults to --input")
+    parser.add_argument("--sim_input", type=str, default=None,
+                        help="Synthetic IMU parquet for sim_latent conditioning "
+                             "(required unless --pair_dir is set)")
     parser.add_argument("--cond_input", type=str, default=None,
                         help="Conditioning trajectory source (.parquet or .hdf5). "
-                             "Defaults to --input. Length must match --imu_input "
-                             "unless --trim_to_match is set")
+                             "Defaults to --input / --imu_input. Length must match "
+                             "--imu_input unless --trim_to_match is set")
     parser.add_argument("--trim_to_match", action="store_true",
                         help="If IMU and cond lengths differ, truncate both to the "
                              "shorter length (prefix) instead of erroring")
     parser.add_argument("--ldm_config", "--config", type=str,
-                        default="configs/imu/ldm_1d.yaml",
+                        default="configs/imu/ldm_1d_sim_cond.yaml",
                         help="LDM model config (must match the checkpoint architecture)")
     parser.add_argument("--ldm_ckpt", type=str, required=True)
     parser.add_argument("--first_stage_ckpt", type=str, required=True,
                         help="VAE checkpoint used as LDM first stage")
     parser.add_argument("--ronin_ckpt", type=str, required=True)
     parser.add_argument("--stats", type=str, required=True, help="Path to stats.pt")
-    parser.add_argument("--outdir", type=str, default="outputs/ronin_ldm_eval")
+    parser.add_argument("--outdir", type=str, default="outputs/ronin_ldm_sim_cond_eval")
     parser.add_argument("--dataset", type=str, default=None,
                         help="Override dataset type for --input (sim_parquet / hybrid)")
     parser.add_argument("--imu_dataset", type=str, default=None,
@@ -969,12 +983,38 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve pair_dir convenience -> imu / sim / cond paths
+    if args.pair_dir is not None:
+        pair_dir = args.pair_dir.rstrip("/")
+        real_hdf5 = osp.join(pair_dir, "real.hdf5")
+        sim_parquet = osp.join(pair_dir, "synthetic.parquet")
+        if not osp.isfile(real_hdf5):
+            raise ValueError(f"Missing real.hdf5 in {pair_dir}")
+        if not osp.isfile(sim_parquet):
+            raise ValueError(f"Missing synthetic.parquet in {pair_dir}")
+        if args.imu_input is None and args.input is None:
+            args.imu_input = real_hdf5
+            args.input = real_hdf5
+        if args.cond_input is None:
+            args.cond_input = real_hdf5
+        if args.sim_input is None:
+            args.sim_input = sim_parquet
+        if args.imu_dataset is None and args.dataset is None:
+            args.imu_dataset = "hybrid"
+        if args.cond_dataset is None and args.dataset is None:
+            args.cond_dataset = "hybrid"
+
     imu_path = args.imu_input or args.input
     cond_path = args.cond_input or args.input
+    sim_path = args.sim_input
     if imu_path is None or cond_path is None:
         raise ValueError(
-            "Provide --input, or both --imu_input and --cond_input "
+            "Provide --pair_dir, or --input, or both --imu_input and --cond_input "
             "(each defaults to --input when omitted)"
+        )
+    if sim_path is None:
+        raise ValueError(
+            "Provide --sim_input (synthetic parquet) or --pair_dir for sim-latent conditioning"
         )
 
     torch.manual_seed(args.seed)
@@ -997,6 +1037,7 @@ def main():
     print(f"IMU source:  {imu_path} ({imu_type})")
     print(f"Cond source: {cond_path} ({cond_type})"
           + ("  [mixed]" if mixed else "  [same as IMU]"))
+    print(f"Sim source:  {sim_path}")
     print(f"Device:  {device}")
     print(f"Strength:{args.strength}")
 
@@ -1050,6 +1091,23 @@ def main():
             gt_pos = gt_pos[:N]
         ts_imu = ts
 
+    sim_features_ldm = load_sim_imu_ldm(sim_path, n_samples=None)
+    if sim_features_ldm.shape[0] < N:
+        if not args.trim_to_match:
+            raise ValueError(
+                f"Sim IMU length {sim_features_ldm.shape[0]} < IMU length {N}. "
+                f"Pass --trim_to_match to truncate."
+            )
+        N = sim_features_ldm.shape[0]
+        print(f"  [trim] Truncating to sim length {N}")
+        features_orig = features_orig[:N]
+        ts = ts[:N]
+        gt_pos = gt_pos[:N]
+        ts_imu = ts_imu[:N]
+        dataset_orig.features[0] = features_orig
+    elif sim_features_ldm.shape[0] > N:
+        sim_features_ldm = sim_features_ldm[:N]
+
     n_ldm_windows = N // LDM_WINDOW
     print(f"  {N} samples ({N / SAMPLE_RATE:.1f}s), {n_ldm_windows} full 10s LDM windows, "
           f"{len(dataset_orig)} RoNIN windows")
@@ -1065,7 +1123,7 @@ def main():
         )
 
     # ---- LDM generation ----
-    print("\nRunning LDM generation ...")
+    print("\nRunning sim-conditioned LDM generation ...")
     features_gen = generate_features_ldm(
         features_orig,
         ts,
@@ -1077,6 +1135,7 @@ def main():
         vel_mean,
         vel_std,
         device,
+        sim_features_ldm=sim_features_ldm,
         ddim_steps=args.ddim_steps,
         ddim_eta=args.ddim_eta,
         use_ema=not args.no_ema,
@@ -1099,6 +1158,8 @@ def main():
     metrics = {
         "imu_input": osp.abspath(imu_path),
         "cond_input": osp.abspath(cond_path),
+        "sim_input": osp.abspath(sim_path),
+        "pair_dir": osp.abspath(args.pair_dir) if args.pair_dir else None,
         "mixed": mixed,
         "trim_to_match": bool(args.trim_to_match),
         "imu_dataset_type": imu_type,

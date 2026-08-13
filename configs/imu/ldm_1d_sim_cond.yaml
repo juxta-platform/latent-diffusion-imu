@@ -1,0 +1,82 @@
+model:
+  target: ldm.models.diffusion.ddpm_1d_sim_cond.LatentDiffusion1DSimCond
+  params:
+    timesteps: 1000
+    beta_schedule: linear
+    linear_start: 1.0e-4
+    linear_end: 2.0e-2
+    loss_type: l2
+    scale_factor: 1.0
+    scale_by_std: true
+    learning_rate: 1.0e-4
+    use_ema: true
+    monitor: val/loss
+
+    first_stage_config:
+      target: ldm.models.autoencoder_1d.AutoencoderKL1D
+      params:
+        embed_dim: 8
+        kl_weight: 1.0e-6
+        ddconfig:
+          ch: 64
+          in_channels: 6
+          out_channels: 6
+          z_channels: 8
+          ch_mult: [1, 2, 4]
+          num_res_blocks: 2
+          dropout: 0.0
+          downsample_factors: [2, 2, 5]
+          upsample_factors: [5, 2, 2]
+          double_z: true
+
+    first_stage_ckpt: ???  # path to trained VAE checkpoint
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.unet_1d.UNetModel1D
+      params:
+        in_channels: 19   # 8 (noisy real latent) + 8 (sim latent) + 2 (vel) + 1 (time)
+        out_channels: 8
+        model_channels: 128
+        channel_mult: [1, 2, 4]
+        num_res_blocks: 2
+        attention_levels: [1, 2]
+        dropout: 0.0
+        num_heads: 8
+
+data:
+  target: ldm.data.paired_imu_dataset.PairedIMUDataModule
+  params:
+    data_dir: ???  # set via CLI
+    batch_size: 32
+    num_workers: 4
+
+lightning:
+  trainer:
+    max_epochs: 50000
+    gpus: 1
+    precision: 16
+    log_every_n_steps: 10
+    check_val_every_n_epoch: 10
+  callbacks:
+    checkpoint:
+      target: pytorch_lightning.callbacks.ModelCheckpoint
+      params:
+        monitor: val/loss
+        save_top_k: 1
+        mode: min
+        save_last: true
+        filename: "best-{epoch:03d}"
+        auto_insert_metric_name: false
+    lr_monitor:
+      target: pytorch_lightning.callbacks.LearningRateMonitor
+      params:
+        logging_interval: step
+    early_stopping:
+      enabled: false
+      target: pytorch_lightning.callbacks.EarlyStopping
+      params:
+        monitor: val/loss
+        patience: 10
+        mode: min
+        verbose: true
+        check_on_train_epoch_end: false
