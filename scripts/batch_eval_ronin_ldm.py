@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Batch RoNIN evaluation across all real/synthetic IMU pairs.
+"""Batch RoNIN evaluation across real/synthetic IMU pairs.
 
-Runs three evaluation commands per trajectory pair:
-  1) eval_ronin_ldm.py on real HDF5 (logs: real_imu, noise_generated)
-  2) eval_ronin_ldm.py on synthetic parquet with real HDF5 as cond
-     (logs: synthetic_imu, strength_generated)
-  3) eval_ronin_ldm_sim_cond.py on pair_dir (logs: sim_cond_generated)
+Compares original vs LDM-generated IMU on a single RoNIN checkpoint.
+Which LDM runs execute depends on which checkpoints you pass:
 
-Then aggregates ATE/RTE into per-trajectory overlays and dataset-level
-summary plots.
+  --ldm_ckpt
+      1) eval_ronin_ldm.py on real HDF5  (real_imu vs noise_generated)
+      2) eval_ronin_ldm.py on synthetic parquet + real cond
+         (synthetic_imu vs strength_generated)
+
+  --ldm_sim_cond_ckpt
+      3) eval_ronin_ldm_sim_cond.py on pair_dir
+         (real IMU vs sim_cond_generated)
+
+Pass either flag, or both. Then aggregates ATE/RTE into per-trajectory
+overlays and dataset-level summary plots.
 """
 
 import argparse
@@ -75,7 +81,7 @@ METHOD_LABELS = [
 
 
 def build_commands(pair_dir, args, outdir_base):
-    """Build the three subprocess commands for a single pair.
+    """Build eval subprocesses for a pair, based on which LDM ckpts were given.
 
     Returns list of (run_name, cmd_list, outdir) tuples.
     """
@@ -84,79 +90,84 @@ def build_commands(pair_dir, args, outdir_base):
 
     commands = []
 
-    # Run 1: eval_ronin_ldm.py on real HDF5
-    run1_out = osp.join(outdir_base, "real_ldm")
-    cmd1 = [
-        sys.executable, "scripts/eval_ronin_ldm.py",
-        "--input", real_hdf5,
-        "--dataset", "hybrid",
-        "--ldm_ckpt", args.ldm_ckpt,
-        "--first_stage_ckpt", args.vae_ckpt,
-        "--ronin_ckpt", args.ronin_ckpt,
-        "--stats", args.stats,
-        "--outdir", run1_out,
-        "--save_trajectories",
-        "--hdf5_out", "",
-        "--parquet_out", "",
-        "--seed", str(args.seed),
-        "--ddim_steps", str(args.ddim_steps),
-        "--ddim_eta", str(args.ddim_eta),
-    ]
-    if args.ldm_config:
-        cmd1 += ["--ldm_config", args.ldm_config]
-    if args.cpu:
-        cmd1.append("--cpu")
-    commands.append(("real_ldm", cmd1, run1_out))
+    if args.ldm_ckpt:
+        # Run 1: eval_ronin_ldm.py on real HDF5 (original vs traj-cond gen)
+        run1_out = osp.join(outdir_base, "real_ldm")
+        cmd1 = [
+            sys.executable, "scripts/eval_ronin_ldm.py",
+            "--input", real_hdf5,
+            "--dataset", "hybrid",
+            "--ldm_ckpt", args.ldm_ckpt,
+            "--first_stage_ckpt", args.vae_ckpt,
+            "--ronin_ckpt", args.ronin_ckpt,
+            "--stats", args.stats,
+            "--outdir", run1_out,
+            "--save_trajectories",
+            "--hdf5_out", "",
+            "--parquet_out", "",
+            "--seed", str(args.seed),
+            "--ddim_steps", str(args.ddim_steps),
+            "--ddim_eta", str(args.ddim_eta),
+        ]
+        if args.ldm_config:
+            cmd1 += ["--ldm_config", args.ldm_config]
+        if args.cpu:
+            cmd1.append("--cpu")
+        commands.append(("real_ldm", cmd1, run1_out))
 
-    # Run 2: eval_ronin_ldm.py on synthetic parquet with real cond
-    run2_out = osp.join(outdir_base, "synthetic_ldm")
-    cmd2 = [
-        sys.executable, "scripts/eval_ronin_ldm.py",
-        "--imu_input", synthetic_pq,
-        "--cond_input", real_hdf5,
-        "--ldm_ckpt", args.ldm_ckpt,
-        "--first_stage_ckpt", args.vae_ckpt,
-        "--ronin_ckpt", args.ronin_ckpt,
-        "--stats", args.stats,
-        "--outdir", run2_out,
-        "--strength", str(args.strength),
-        "--trim_to_match",
-        "--save_trajectories",
-        "--hdf5_out", "",
-        "--parquet_out", "",
-        "--seed", str(args.seed),
-        "--ddim_steps", str(args.ddim_steps),
-        "--ddim_eta", str(args.ddim_eta),
-    ]
-    if args.ldm_config:
-        cmd2 += ["--ldm_config", args.ldm_config]
-    if args.cpu:
-        cmd2.append("--cpu")
-    commands.append(("synthetic_ldm", cmd2, run2_out))
+        # Run 2: eval_ronin_ldm.py on synthetic parquet with real cond
+        if osp.isfile(synthetic_pq):
+            run2_out = osp.join(outdir_base, "synthetic_ldm")
+            cmd2 = [
+                sys.executable, "scripts/eval_ronin_ldm.py",
+                "--imu_input", synthetic_pq,
+                "--cond_input", real_hdf5,
+                "--ldm_ckpt", args.ldm_ckpt,
+                "--first_stage_ckpt", args.vae_ckpt,
+                "--ronin_ckpt", args.ronin_ckpt,
+                "--stats", args.stats,
+                "--outdir", run2_out,
+                "--strength", str(args.strength),
+                "--trim_to_match",
+                "--save_trajectories",
+                "--hdf5_out", "",
+                "--parquet_out", "",
+                "--seed", str(args.seed),
+                "--ddim_steps", str(args.ddim_steps),
+                "--ddim_eta", str(args.ddim_eta),
+            ]
+            if args.ldm_config:
+                cmd2 += ["--ldm_config", args.ldm_config]
+            if args.cpu:
+                cmd2.append("--cpu")
+            commands.append(("synthetic_ldm", cmd2, run2_out))
+        else:
+            print(f"  [skip] synthetic_ldm — no parquet at {synthetic_pq}")
 
-    # Run 3: eval_ronin_ldm_sim_cond.py
-    run3_out = osp.join(outdir_base, "sim_cond_ldm")
-    cmd3 = [
-        sys.executable, "scripts/eval_ronin_ldm_sim_cond.py",
-        "--pair_dir", pair_dir,
-        "--ldm_ckpt", args.ldm_sim_cond_ckpt,
-        "--first_stage_ckpt", args.vae_ckpt,
-        "--ronin_ckpt", args.ronin_ckpt,
-        "--stats", args.stats_sim_cond,
-        "--outdir", run3_out,
-        "--trim_to_match",
-        "--save_trajectories",
-        "--hdf5_out", "",
-        "--parquet_out", "",
-        "--seed", str(args.seed),
-        "--ddim_steps", str(args.ddim_steps),
-        "--ddim_eta", str(args.ddim_eta),
-    ]
-    if args.ldm_sim_cond_config:
-        cmd3 += ["--ldm_config", args.ldm_sim_cond_config]
-    if args.cpu:
-        cmd3.append("--cpu")
-    commands.append(("sim_cond_ldm", cmd3, run3_out))
+    if args.ldm_sim_cond_ckpt:
+        # Run 3: eval_ronin_ldm_sim_cond.py (original vs sim-cond gen)
+        run3_out = osp.join(outdir_base, "sim_cond_ldm")
+        cmd3 = [
+            sys.executable, "scripts/eval_ronin_ldm_sim_cond.py",
+            "--pair_dir", pair_dir,
+            "--ldm_ckpt", args.ldm_sim_cond_ckpt,
+            "--first_stage_ckpt", args.vae_ckpt,
+            "--ronin_ckpt", args.ronin_ckpt,
+            "--stats", args.stats_sim_cond,
+            "--outdir", run3_out,
+            "--trim_to_match",
+            "--save_trajectories",
+            "--hdf5_out", "",
+            "--parquet_out", "",
+            "--seed", str(args.seed),
+            "--ddim_steps", str(args.ddim_steps),
+            "--ddim_eta", str(args.ddim_eta),
+        ]
+        if args.ldm_sim_cond_config:
+            cmd3 += ["--ldm_config", args.ldm_sim_cond_config]
+        if args.cpu:
+            cmd3.append("--cpu")
+        commands.append(("sim_cond_ldm", cmd3, run3_out))
 
     return commands
 
@@ -264,6 +275,12 @@ def plot_trajectory_overlay(pair_outdir, pair_id):
     if "sim_cond_ldm" in traj_data:
         d = traj_data["sim_cond_ldm"]
         m = metrics_data["sim_cond_ldm"]
+        # Original IMU lives on this run when traj-LDM (real_ldm) was skipped.
+        if "real_imu" not in methods:
+            methods["real_imu"] = {
+                "pos_pred": d["pos_pred_orig"], "pos_gt": d["pos_gt"],
+                "ate": m["original"]["ate"], "rte": m["original"]["rte"],
+            }
         methods["sim_cond_generated"] = {
             "pos_pred": d["pos_pred_gen"], "pos_gt": d["pos_gt"],
             "ate": m["ldm_gen"]["ate"], "rte": m["ldm_gen"]["rte"],
@@ -423,14 +440,16 @@ def main():
                         help="VAE first-stage checkpoint")
     parser.add_argument("--ronin_ckpt", type=str, required=True,
                         help="RoNIN checkpoint")
-    parser.add_argument("--ldm_ckpt", type=str, required=True,
-                        help="LDM checkpoint for eval_ronin_ldm.py runs")
-    parser.add_argument("--ldm_sim_cond_ckpt", type=str, required=True,
-                        help="LDM checkpoint for eval_ronin_ldm_sim_cond.py runs")
-    parser.add_argument("--stats", type=str, required=True,
-                        help="stats.pt for the standard LDM (eval_ronin_ldm.py)")
-    parser.add_argument("--stats_sim_cond", type=str, required=True,
-                        help="stats.pt for the sim-conditioned LDM")
+    parser.add_argument("--ldm_ckpt", type=str, default=None,
+                        help="Trajectory-conditioned LDM (eval_ronin_ldm.py). "
+                             "Omit to skip those runs.")
+    parser.add_argument("--ldm_sim_cond_ckpt", type=str, default=None,
+                        help="Sim-conditioned LDM (eval_ronin_ldm_sim_cond.py). "
+                             "Omit to skip that run.")
+    parser.add_argument("--stats", type=str, default=None,
+                        help="stats.pt for --ldm_ckpt (required if that ckpt is set)")
+    parser.add_argument("--stats_sim_cond", type=str, default=None,
+                        help="stats.pt for --ldm_sim_cond_ckpt (required if that ckpt is set)")
     parser.add_argument("--outdir", type=str, default="outputs/batch_eval",
                         help="Root output directory")
     parser.add_argument("--strength", type=float, default=0.5,
@@ -450,6 +469,20 @@ def main():
     parser.add_argument("--plots_only", action="store_true",
                         help="Skip eval runs, only regenerate comparison plots from existing results")
     args = parser.parse_args()
+
+    if not args.ldm_ckpt and not args.ldm_sim_cond_ckpt:
+        parser.error("provide --ldm_ckpt and/or --ldm_sim_cond_ckpt")
+    if args.ldm_ckpt and not args.stats:
+        parser.error("--stats is required when --ldm_ckpt is set")
+    if args.ldm_sim_cond_ckpt and not args.stats_sim_cond:
+        parser.error("--stats_sim_cond is required when --ldm_sim_cond_ckpt is set")
+
+    enabled = []
+    if args.ldm_ckpt:
+        enabled.append("traj LDM (--ldm_ckpt)")
+    if args.ldm_sim_cond_ckpt:
+        enabled.append("sim-cond LDM (--ldm_sim_cond_ckpt)")
+    print("Enabled runs: " + ", ".join(enabled))
 
     test_root = osp.abspath(args.test_root)
     outdir = osp.abspath(args.outdir)
@@ -508,8 +541,15 @@ def main():
         with open(failed_path, "w") as f:
             json.dump(failed, f, indent=2)
 
+    n_cmds = 0
+    if not args.plots_only:
+        # Count from the first pair so dry-run / summary match what we will run.
+        sample_cmds = build_commands(osp.join(test_root, pairs[0]), args, "/tmp")
+        n_cmds = len(sample_cmds)
+
     if args.dry_run:
-        print(f"\n[DRY-RUN] Would execute {len(pairs) * 3} commands for {len(pairs)} pairs")
+        print(f"\n[DRY-RUN] Would execute {len(pairs) * n_cmds} commands for {len(pairs)} pairs "
+              f"({n_cmds} per pair)")
     else:
         print(f"\nDone. Results in {outdir}")
 

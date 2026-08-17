@@ -320,42 +320,13 @@ def ronin_to_ldm_channels(feat):
     return feat[:, [3, 4, 5, 0, 1, 2]]
 
 
-def world_imu_to_local(features_ronin, game_rv):
-    """Rotate world-frame IMU back to device/local frame via game_rv.
-
-    Inverse of the local->world transform used in _HDF5Sequence.load /
-    preprocess_imu (ori * v * conj(ori)).
-
-    Args:
-        features_ronin: [N, 6] world-frame in RoNIN order [gyro, accel]
-        game_rv: [N, 4] unit quaternions (w, x, y, z)
-    Returns:
-        acce_local [N, 3], gyro_local [N, 3]
-    """
-    n = features_ronin.shape[0]
-    if game_rv.shape[0] < n:
-        raise ValueError(
-            f"game_rv length {game_rv.shape[0]} < IMU length {n}"
-        )
-    gyro_w = features_ronin[:, :3]
-    acce_w = features_ronin[:, 3:6]
-    ori_q = quaternion.from_float_array(game_rv[:n])
-    nz = np.zeros((n, 1))
-    gyro_q = quaternion.from_float_array(np.concatenate([nz, gyro_w], axis=1))
-    acce_q = quaternion.from_float_array(np.concatenate([nz, acce_w], axis=1))
-    # local = conj(ori) * world * ori
-    gyro_local = quaternion.as_float_array(ori_q.conj() * gyro_q * ori_q)[:, 1:]
-    acce_local = quaternion.as_float_array(ori_q.conj() * acce_q * ori_q)[:, 1:]
-    return acce_local, gyro_local
-
-
 def write_generated_hdf5(src_path, out_path, features_gen_ronin):
     """Copy src HDF5 and replace synced/acce + synced/gyro with generated IMU.
 
     features_gen_ronin is world-frame [N, 6] in RoNIN order [gyro, accel];
-    it is rotated to local frame using synced/game_rv before writing.
+    stored directly into synced/gyro and synced/acce (no local-frame rotation).
     All other datasets (including linacce) are left unchanged. Trailing
-    samples beyond N keep the original local IMU.
+    samples beyond N keep the original IMU.
     """
     import shutil
 
@@ -364,22 +335,19 @@ def write_generated_hdf5(src_path, out_path, features_gen_ronin):
 
     shutil.copy2(src_path, out_path)
     with h5py.File(out_path, "a") as f:
-        if "synced" not in f or "game_rv" not in f["synced"]:
-            raise ValueError(f"{src_path} missing synced/game_rv; cannot convert to local")
-        game_rv = np.copy(f["synced/game_rv"][:]).astype(np.float64)
+        if "synced" not in f or "acce" not in f["synced"] or "gyro" not in f["synced"]:
+            raise ValueError(f"{src_path} missing synced/acce or synced/gyro")
         n_file = f["synced/acce"].shape[0]
-        n_write = min(N, n_file, game_rv.shape[0])
+        n_write = min(N, n_file)
         if n_write < N:
             print(f"  [warn] Truncating generated IMU {N} -> {n_write} to fit HDF5 length")
 
-        acce_local, gyro_local = world_imu_to_local(
-            features_gen_ronin[:n_write], game_rv[:n_write]
-        )
-        f["synced/acce"][:n_write] = acce_local
-        f["synced/gyro"][:n_write] = gyro_local
-        # Leave linacce / others as original (local-frame source data)
+        gyro_world = features_gen_ronin[:n_write, :3]
+        acce_world = features_gen_ronin[:n_write, 3:6]
+        f["synced/acce"][:n_write] = acce_world
+        f["synced/gyro"][:n_write] = gyro_world
 
-    print(f"Wrote generated local-frame IMU HDF5 to {out_path} "
+    print(f"Wrote generated world-frame IMU HDF5 to {out_path} "
           f"({n_write}/{n_file} samples replaced)")
     return out_path
 
@@ -962,14 +930,19 @@ def main():
     parser.add_argument(
         "--hdf5_out",
         type=str,
+        nargs="?",
+        const=None,
         default=None,
-        help="Output path for HDF5 with generated local-frame IMU "
+        help="Output path for HDF5 with generated world-frame IMU "
              "(default: <outdir>/<imu_stem>_ldm_gen.hdf5). "
-             "Only written when IMU source is HDF5. Pass empty string to disable.",
+             "Written by default when an HDF5 template is available "
+             "(IMU source, else cond source). Pass empty string to disable.",
     )
     parser.add_argument(
         "--parquet_out",
         type=str,
+        nargs="?",
+        const=None,
         default=None,
         help="Output path for parquet with generated world-frame IMU "
              "(default: <outdir>/<imu_stem>_ldm_gen.parquet). "
@@ -1202,20 +1175,34 @@ def main():
     plot_position_error(res_orig, res_gen, args.outdir)
     plot_imu_windows(features_orig, features_gen, args.outdir, n_plot=args.n_imu_plot)
 
-    # ---- Export generated IMU into the IMU-source file format ----
+    # ---- Export generated IMU (HDF5 by default; parquet when IMU is parquet) ----
     stem = osp.splitext(osp.basename(imu_path.rstrip("/")))[0]
-    if imu_type != "sim_parquet" and args.hdf5_out != "":
-        if args.hdf5_out is None:
-            hdf5_out = osp.join(args.outdir, f"{stem}_ldm_gen.hdf5")
+    wrote_export = False
+
+    if args.hdf5_out != "":
+        if imu_type != "sim_parquet":
+            src_hdf5 = (
+                imu_path if imu_path.endswith((".hdf5", ".h5")) else imu_path + ".hdf5"
+            )
+        elif cond_type != "sim_parquet":
+            src_hdf5 = (
+                cond_path if cond_path.endswith((".hdf5", ".h5")) else cond_path + ".hdf5"
+            )
         else:
-            hdf5_out = args.hdf5_out
-        print("\nWriting generated IMU HDF5 (world -> local via game_rv) ...")
-        src_hdf5 = imu_path if imu_path.endswith((".hdf5", ".h5")) else imu_path + ".hdf5"
-        write_generated_hdf5(src_hdf5, hdf5_out, features_gen)
-        metrics["hdf5_out"] = osp.abspath(hdf5_out)
-        with open(metrics_path, "w") as f:
-            json.dump(metrics, f, indent=2)
-    elif imu_type == "sim_parquet" and args.parquet_out != "":
+            src_hdf5 = None
+        if src_hdf5 is not None and osp.isfile(src_hdf5):
+            if args.hdf5_out is None:
+                hdf5_out = osp.join(args.outdir, f"{stem}_ldm_gen.hdf5")
+            else:
+                hdf5_out = args.hdf5_out
+            print("\nWriting generated IMU HDF5 (world-frame synced/acce+gyro) ...")
+            write_generated_hdf5(src_hdf5, hdf5_out, features_gen)
+            metrics["hdf5_out"] = osp.abspath(hdf5_out)
+            wrote_export = True
+        elif src_hdf5 is not None:
+            print(f"\n[warn] Skipping HDF5 export; template not found: {src_hdf5}")
+
+    if imu_type == "sim_parquet" and args.parquet_out != "":
         if args.parquet_out is None:
             parquet_out = osp.join(args.outdir, f"{stem}_ldm_gen.parquet")
         else:
@@ -1224,6 +1211,9 @@ def main():
         src_pq = imu_path if imu_path.endswith(".parquet") else imu_path + ".parquet"
         write_generated_parquet(src_pq, parquet_out, features_gen, ts_imu[: features_gen.shape[0]])
         metrics["parquet_out"] = osp.abspath(parquet_out)
+        wrote_export = True
+
+    if wrote_export:
         with open(metrics_path, "w") as f:
             json.dump(metrics, f, indent=2)
 

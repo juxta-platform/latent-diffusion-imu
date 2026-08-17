@@ -15,6 +15,12 @@ Modes:
      parquet with stale local columns, pass --parquet_from_world with
      --imu_frame local to rotate world→local via phone_rot.
 
+  3) Directory of trajectories:
+       --input_dir data/ronin_ldm_gen_world
+     Runs mode (2) on every .hdf5 / .parquet in the folder. Writes per-file
+     subdirs plus a summary.json. For LDM gen_world HDF5s (world IMU already
+     in synced/acce|gyro), pass --hdf5_already_world with --imu_frame world.
+
 Example usage:
   python scripts/eval_carrying_classifier.py \
       --config configs/imu/vae_1d.yaml \
@@ -29,6 +35,14 @@ Example usage:
       --clf_ckpt logs/carrying_classifier/best_classifier.pt \
       --input data/real_data_by_carrying_type/pocket/john_left_pocket_ios_corrected.hdf5 \
       --outdir outputs/carrying_eval_single
+
+  python scripts/eval_carrying_classifier.py \
+      --config configs/imu/vae_1d.yaml \
+      --vae_ckpt logs/vae_1d/.../total_loss=0.0116.ckpt \
+      --clf_ckpt logs/carrying_classifier/best_classifier.pt \
+      --input_dir data/ronin_ldm_gen_world \
+      --imu_frame world --hdf5_already_world \
+      --outdir outputs/carrying_eval_gen_world
 """
 
 import argparse
@@ -359,25 +373,84 @@ def resolve_train_results(train_results, clf_ckpt):
     return None
 
 
+def infer_gt_class_from_name(path, class_names):
+    """Best-effort GT class from filename prefixes used in gen_world exports."""
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    rules = [
+        ("demohand", "demo_hand"),
+        ("demo_hand", "demo_hand"),
+        ("left_pocket", "pocket"),
+        ("right_pocket", "pocket"),
+        ("left_swing", "swinging"),
+        ("right_swing", "swinging"),
+        ("chest", "chest"),
+        ("pocket", "pocket"),
+        ("swing", "swinging"),
+        ("hand", "demo_hand"),
+    ]
+    for prefix, cls in rules:
+        if stem.startswith(prefix):
+            return cls if cls in class_names else None
+    return None
+
+
+def list_trajectory_files(input_dir):
+    """Sorted .hdf5 / .parquet files directly under input_dir."""
+    files = []
+    for name in sorted(os.listdir(input_dir)):
+        path = os.path.join(input_dir, name)
+        if not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext in (".hdf5", ".h5", ".parquet"):
+            files.append(path)
+    return files
+
+
 # ---------------------------------------------------------------------------
 # Single trajectory mode
 # ---------------------------------------------------------------------------
 
-def eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_names):
-    """Classify consecutive non-overlapping windows from a single file."""
+def eval_single_trajectory(
+    args, vae, mlp, imu_mean, imu_std, device, class_names,
+    input_path=None, outdir=None, write_window_plots=True,
+):
+    """Classify consecutive non-overlapping windows from a single file.
+
+    Returns results dict, or None if the recording is too short.
+    """
+    from collections import Counter
+
+    input_path = input_path or args.input
+    outdir = outdir or args.outdir
+    os.makedirs(outdir, exist_ok=True)
+
     preprocess = _load_process_file()
-    ext = os.path.splitext(args.input)[1].lower()
-    local_frame = args.imu_frame == "local"
+    ext = os.path.splitext(input_path)[1].lower()
+    want_local = args.imu_frame == "local"
 
     if ext in (".hdf5", ".h5"):
-        acce, gyro, pos, time = preprocess.load_hdf5(
-            args.input, local_frame=local_frame
-        )
-        print(f"  hdf5 IMU: {'local' if local_frame else 'world (via game_rv)'}")
+        # gen_world exports store world IMU in synced/acce|gyro already.
+        # Skip game_rv when --hdf5_already_world (typical with --imu_frame world).
+        if getattr(args, "hdf5_already_world", False):
+            if want_local:
+                raise ValueError(
+                    "--hdf5_already_world is for world-frame synced IMU; "
+                    "use --imu_frame world (not local)"
+                )
+            acce, gyro, pos, time = preprocess.load_hdf5(
+                input_path, local_frame=True
+            )
+            print("  hdf5 IMU: world (synced as-is, no game_rv)")
+        else:
+            acce, gyro, pos, time = preprocess.load_hdf5(
+                input_path, local_frame=want_local
+            )
+            print(f"  hdf5 IMU: {'local' if want_local else 'world (via game_rv)'}")
         imu_raw = np.concatenate([acce, gyro], axis=1)  # [N, 6]
     elif ext == ".parquet":
         imu_raw = load_parquet_imu(
-            args.input,
+            input_path,
             imu_frame=args.imu_frame,
             parquet_from_world=args.parquet_from_world,
             world_heading=args.world_heading,
@@ -389,17 +462,15 @@ def eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_name
     n_windows = N // WINDOW_SAMPLES
     if n_windows == 0:
         print(f"Recording too short for a full 10s window ({N} samples)")
-        return
+        return None
 
     print(f"  {N} samples ({N / SAMPLE_RATE:.1f}s), {n_windows} consecutive windows")
-
-    plot_dir = os.path.join(args.outdir, "window_plots")
-    os.makedirs(plot_dir, exist_ok=True)
 
     mean = imu_mean.view(6, 1)
     std = imu_std.view(6, 1)
     predictions = []
     all_logits = []
+    window_imus = []
 
     clf = CarryingTypeClassifier(vae, mlp)
     clf.eval()
@@ -416,29 +487,38 @@ def eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_name
 
         predictions.append(pred)
         all_logits.append(logits_np)
-        time_offset = i * (WINDOW_SAMPLES / SAMPLE_RATE)
-
-        conf = float(_softmax(logits_np)[pred])
-        pred_label = f"{class_names[pred]} ({conf:.2f})"
-        plot_imu_window(w_imu.numpy(), plot_dir, i,
-                        gt_label="N/A", pred_label=pred_label,
-                        sample_rate=SAMPLE_RATE, time_offset=time_offset)
+        window_imus.append(w_imu.numpy())
 
     all_logits = np.stack(all_logits, axis=0)
-    plot_timeline(predictions, class_names, args.outdir,
+    plot_timeline(predictions, class_names, outdir,
                   window_sec=WINDOW_SAMPLES / SAMPLE_RATE, logits=all_logits)
 
-    # Majority vote
-    from collections import Counter
+    if write_window_plots:
+        plot_dir = os.path.join(outdir, "window_plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        n_plot = n_windows if args.n_plot < 0 else min(args.n_plot, n_windows)
+        for i in range(n_plot):
+            conf = float(_softmax(all_logits[i])[predictions[i]])
+            pred_label = f"{class_names[predictions[i]]} ({conf:.2f})"
+            time_offset = i * (WINDOW_SAMPLES / SAMPLE_RATE)
+            plot_imu_window(
+                window_imus[i], plot_dir, i,
+                gt_label="N/A", pred_label=pred_label,
+                sample_rate=SAMPLE_RATE, time_offset=time_offset,
+            )
+        print(f"Saved {n_plot} window plots to {plot_dir}")
+
     counts = Counter(predictions)
     majority = counts.most_common(1)[0]
     probs = np.stack([_softmax(all_logits[i]) for i in range(n_windows)], axis=0)
+    gt_class = infer_gt_class_from_name(input_path, class_names)
     print(f"\nPer-window predictions: {[class_names[p] for p in predictions]}")
     print(f"Per-window confidence: {[f'{probs[i, predictions[i]]:.2f}' for i in range(n_windows)]}")
-    print(f"Majority vote: {class_names[majority[0]]} ({majority[1]}/{len(predictions)} windows)")
+    print(f"Majority vote: {class_names[majority[0]]} ({majority[1]}/{len(predictions)} windows)"
+          + (f"  |  GT(from name): {gt_class}" if gt_class else ""))
 
     results = {
-        "input": os.path.abspath(args.input),
+        "input": os.path.abspath(input_path),
         "n_windows": n_windows,
         "predictions": [class_names[p] for p in predictions],
         "logits": all_logits.tolist(),
@@ -446,12 +526,74 @@ def eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_name
         "confidence": [float(probs[i, predictions[i]]) for i in range(n_windows)],
         "majority_vote": class_names[majority[0]],
         "majority_count": majority[1],
+        "gt_from_name": gt_class,
         "class_names": list(class_names),
     }
-    with open(os.path.join(args.outdir, "results.json"), "w") as f:
+    with open(os.path.join(outdir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
+    return results
 
-    print(f"Saved {n_windows} window plots to {plot_dir}")
+
+def eval_input_dir(args, vae, mlp, imu_mean, imu_std, device, class_names):
+    """Run single-trajectory eval on every hdf5/parquet under --input_dir."""
+    files = list_trajectory_files(args.input_dir)
+    if not files:
+        raise ValueError(f"No .hdf5 / .parquet files found in {args.input_dir}")
+
+    print(f"  {len(files)} trajectories in {args.input_dir}")
+    write_window_plots = args.n_plot != 0
+
+    per_file = []
+    n_correct = 0
+    n_labeled = 0
+    for i, path in enumerate(files):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        subdir = os.path.join(args.outdir, stem)
+        print(f"\n[{i + 1}/{len(files)}] {path}")
+        res = eval_single_trajectory(
+            args, vae, mlp, imu_mean, imu_std, device, class_names,
+            input_path=path, outdir=subdir,
+            write_window_plots=write_window_plots,
+        )
+        if res is None:
+            per_file.append({"input": os.path.abspath(path), "error": "too_short"})
+            continue
+        per_file.append({
+            "input": res["input"],
+            "stem": stem,
+            "majority_vote": res["majority_vote"],
+            "majority_count": res["majority_count"],
+            "n_windows": res["n_windows"],
+            "gt_from_name": res.get("gt_from_name"),
+            "correct": (
+                res.get("gt_from_name") is not None
+                and res["majority_vote"] == res["gt_from_name"]
+            ),
+        })
+        if res.get("gt_from_name") is not None:
+            n_labeled += 1
+            if res["majority_vote"] == res["gt_from_name"]:
+                n_correct += 1
+
+    summary = {
+        "input_dir": os.path.abspath(args.input_dir),
+        "n_files": len(files),
+        "n_evaluated": sum(1 for r in per_file if "majority_vote" in r),
+        "imu_frame": args.imu_frame,
+        "hdf5_already_world": bool(getattr(args, "hdf5_already_world", False)),
+        "files": per_file,
+    }
+    if n_labeled > 0:
+        summary["majority_accuracy_vs_name"] = float(n_correct / n_labeled)
+        summary["n_labeled_from_name"] = n_labeled
+        print(f"\nMajority accuracy vs filename class: "
+              f"{n_correct}/{n_labeled} = {n_correct / n_labeled:.3f}")
+
+    summary_path = os.path.join(args.outdir, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nWrote directory summary to {summary_path}")
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +683,9 @@ def main():
                         help="Classifier checkpoint (best_classifier.pt)")
     parser.add_argument("--input", type=str, default=None,
                         help="Single .hdf5 or .parquet trajectory")
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="Directory of .hdf5 / .parquet trajectories "
+                             "(runs single-traj eval on each)")
     parser.add_argument(
         "--imu_frame",
         type=str,
@@ -549,6 +694,12 @@ def main():
         help="IMU frame fed to the classifier: 'local' (device) or 'world' "
              "(HDF5 via game_rv; parquet *_world_* columns). "
              "Defaults to imu_frame stored in --clf_ckpt, else 'local'.",
+    )
+    parser.add_argument(
+        "--hdf5_already_world",
+        action="store_true",
+        help="HDF5 synced/acce|gyro are already world-frame (e.g. gen_world "
+             "LDM exports). Skip game_rv. Use with --imu_frame world.",
     )
     parser.add_argument(
         "--parquet_from_world",
@@ -569,8 +720,9 @@ def main():
     parser.add_argument("--stats", type=str, default=None)
     parser.add_argument("--outdir", type=str, default="outputs/carrying_eval")
     parser.add_argument("--n_plot", type=int, default=8,
-                        help="Labeled-split: number of window plots (-1 = all). "
-                             "Single-trajectory always plots every timeline window.")
+                        help="Window plots per trajectory (-1 = all, 0 = none "
+                             "in --input_dir mode). Single --input still uses "
+                             "this cap (default 8); set -1 for every window.")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--stride_sec", type=float, default=2.0)
@@ -617,11 +769,16 @@ def main():
     if args.input is not None:
         print(f"\nEvaluating single trajectory: {args.input}")
         eval_single_trajectory(args, vae, mlp, imu_mean, imu_std, device, class_names)
+    elif args.input_dir is not None:
+        print(f"\nEvaluating directory: {args.input_dir}")
+        eval_input_dir(args, vae, mlp, imu_mean, imu_std, device, class_names)
     elif args.data_dir is not None:
         print(f"\nEvaluating labeled {args.split} split from {args.data_dir}")
         eval_labeled_split(args, vae, mlp, imu_mean, imu_std, device, class_names)
     else:
-        raise ValueError("Provide --input (single trajectory) or --data_dir (labeled split)")
+        raise ValueError(
+            "Provide --input, --input_dir, or --data_dir (labeled split)"
+        )
 
     print(f"\nDone. Results in {args.outdir}")
 
