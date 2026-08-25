@@ -113,6 +113,7 @@ def build_commands(pair_dir, args, outdir_base):
             cmd1 += ["--ldm_config", args.ldm_config]
         if args.cpu:
             cmd1.append("--cpu")
+        cmd1 += ["--rte_delta_sec", str(args.rte_delta_sec)]
         commands.append(("real_ldm", cmd1, run1_out))
 
         # Run 2: eval_ronin_ldm.py on synthetic parquet with real cond
@@ -140,6 +141,7 @@ def build_commands(pair_dir, args, outdir_base):
                 cmd2 += ["--ldm_config", args.ldm_config]
             if args.cpu:
                 cmd2.append("--cpu")
+            cmd2 += ["--rte_delta_sec", str(args.rte_delta_sec)]
             commands.append(("synthetic_ldm", cmd2, run2_out))
         else:
             print(f"  [skip] synthetic_ldm — no parquet at {synthetic_pq}")
@@ -167,6 +169,7 @@ def build_commands(pair_dir, args, outdir_base):
             cmd3 += ["--ldm_config", args.ldm_sim_cond_config]
         if args.cpu:
             cmd3.append("--cpu")
+        cmd3 += ["--rte_delta_sec", str(args.rte_delta_sec)]
         commands.append(("sim_cond_ldm", cmd3, run3_out))
 
     return commands
@@ -229,6 +232,20 @@ def run_command(run_name, cmd, outdir, pair_id, dry_run=False, force=False):
 # Per-trajectory comparison plots
 # ---------------------------------------------------------------------------
 
+def _metric_block(block):
+    return {
+        "ate": block["ate"],
+        "rte": block["rte"],
+        "rte_short": block.get("rte_short", block["rte"]),
+    }
+
+
+def _format_rte_sec(sec):
+    if float(sec).is_integer():
+        return f"{int(sec)}s"
+    return f"{sec:g}s"
+
+
 def plot_trajectory_overlay(pair_outdir, pair_id):
     """Create five-method trajectory overlay and ATE/RTE bar chart for one pair."""
     traj_data = {}
@@ -248,6 +265,12 @@ def plot_trajectory_overlay(pair_outdir, pair_id):
     if not traj_data:
         return None
 
+    rte_delta_sec = next(
+        (m.get("rte_delta_sec", 10.0) for m in metrics_data.values()),
+        10.0,
+    )
+    short = _format_rte_sec(rte_delta_sec)
+
     # Map run outputs to the 5 method labels
     methods = {}
     if "real_ldm" in traj_data:
@@ -255,22 +278,22 @@ def plot_trajectory_overlay(pair_outdir, pair_id):
         m = metrics_data["real_ldm"]
         methods["real_imu"] = {
             "pos_pred": d["pos_pred_orig"], "pos_gt": d["pos_gt"],
-            "ate": m["original"]["ate"], "rte": m["original"]["rte"],
+            **_metric_block(m["original"]),
         }
         methods["noise_generated"] = {
             "pos_pred": d["pos_pred_gen"], "pos_gt": d["pos_gt"],
-            "ate": m["ldm_gen"]["ate"], "rte": m["ldm_gen"]["rte"],
+            **_metric_block(m["ldm_gen"]),
         }
     if "synthetic_ldm" in traj_data:
         d = traj_data["synthetic_ldm"]
         m = metrics_data["synthetic_ldm"]
         methods["synthetic_imu"] = {
             "pos_pred": d["pos_pred_orig"], "pos_gt": d["pos_gt"],
-            "ate": m["original"]["ate"], "rte": m["original"]["rte"],
+            **_metric_block(m["original"]),
         }
         methods["strength_generated"] = {
             "pos_pred": d["pos_pred_gen"], "pos_gt": d["pos_gt"],
-            "ate": m["ldm_gen"]["ate"], "rte": m["ldm_gen"]["rte"],
+            **_metric_block(m["ldm_gen"]),
         }
     if "sim_cond_ldm" in traj_data:
         d = traj_data["sim_cond_ldm"]
@@ -279,11 +302,11 @@ def plot_trajectory_overlay(pair_outdir, pair_id):
         if "real_imu" not in methods:
             methods["real_imu"] = {
                 "pos_pred": d["pos_pred_orig"], "pos_gt": d["pos_gt"],
-                "ate": m["original"]["ate"], "rte": m["original"]["rte"],
+                **_metric_block(m["original"]),
             }
         methods["sim_cond_generated"] = {
             "pos_pred": d["pos_pred_gen"], "pos_gt": d["pos_gt"],
-            "ate": m["ldm_gen"]["ate"], "rte": m["ldm_gen"]["rte"],
+            **_metric_block(m["ldm_gen"]),
         }
 
     if not methods:
@@ -308,10 +331,11 @@ def plot_trajectory_overlay(pair_outdir, pair_id):
         ax.plot(
             m["pos_pred"][:, 0], m["pos_pred"][:, 1],
             color=colors[label], lw=1.0, alpha=0.8,
-            label=f"{label} (ATE={m['ate']:.3f}, RTE={m['rte']:.3f})",
+            label=(f"{label} (ATE={m['ate']:.3f}, "
+                   f"RTE_60s={m['rte']:.3f}, RTE_{short}={m['rte_short']:.3f})"),
         )
     ax.set_title(f"Trajectory Comparison — {pair_id}", fontsize=11)
-    ax.legend(fontsize=9, loc="best")
+    ax.legend(fontsize=8, loc="best")
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
@@ -323,26 +347,35 @@ def plot_trajectory_overlay(pair_outdir, pair_id):
     present_labels = [l for l in METHOD_LABELS if l in methods]
     ates = [methods[l]["ate"] for l in present_labels]
     rtes = [methods[l]["rte"] for l in present_labels]
+    rtes_short = [methods[l]["rte_short"] for l in present_labels]
 
     x = np.arange(len(present_labels))
-    width = 0.35
-    fig2, ax2 = plt.subplots(figsize=(10, 5))
-    bars1 = ax2.bar(x - width / 2, ates, width, label="ATE", color="steelblue")
-    bars2 = ax2.bar(x + width / 2, rtes, width, label="RTE", color="salmon")
+    width = 0.25
+    fig2, ax2 = plt.subplots(figsize=(11, 5))
+    bars1 = ax2.bar(x - width, ates, width, label="ATE", color="steelblue")
+    bars2 = ax2.bar(x, rtes, width, label="RTE 60s", color="salmon")
+    bars3 = ax2.bar(x + width, rtes_short, width, label=f"RTE {short}", color="seagreen")
     ax2.set_xticks(x)
     ax2.set_xticklabels(present_labels, rotation=30, ha="right", fontsize=9)
     ax2.set_ylabel("Error (m)")
     ax2.set_title(f"ATE / RTE Comparison — {pair_id}", fontsize=11)
     ax2.legend()
-    ax2.bar_label(bars1, fmt="%.3f", fontsize=7, padding=2)
-    ax2.bar_label(bars2, fmt="%.3f", fontsize=7, padding=2)
+    ax2.bar_label(bars1, fmt="%.3f", fontsize=6, padding=2)
+    ax2.bar_label(bars2, fmt="%.3f", fontsize=6, padding=2)
+    ax2.bar_label(bars3, fmt="%.3f", fontsize=6, padding=2)
     fig2.tight_layout()
     bar_path = osp.join(pair_outdir, "five_method_ate_rte.png")
     fig2.savefig(bar_path, dpi=150)
     plt.close(fig2)
 
-    return {label: {"ate": methods[label]["ate"], "rte": methods[label]["rte"]}
-            for label in present_labels}
+    return {
+        label: {
+            "ate": methods[label]["ate"],
+            "rte": methods[label]["rte"],
+            "rte_short": methods[label]["rte_short"],
+        }
+        for label in present_labels
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +389,12 @@ def plot_aggregate(all_results, outdir):
         return
 
     # Collect per-method lists
-    per_method = {l: {"ate": [], "rte": []} for l in METHOD_LABELS}
+    per_method = {l: {"ate": [], "rte": [], "rte_short": []} for l in METHOD_LABELS}
     for pair_id, methods in all_results.items():
         for label, vals in methods.items():
             per_method[label]["ate"].append(vals["ate"])
             per_method[label]["rte"].append(vals["rte"])
+            per_method[label]["rte_short"].append(vals.get("rte_short", vals["rte"]))
 
     present = [l for l in METHOD_LABELS if per_method[l]["ate"]]
     if not present:
@@ -371,21 +405,26 @@ def plot_aggregate(all_results, outdir):
     std_ate = [np.std(per_method[l]["ate"]) for l in present]
     mean_rte = [np.mean(per_method[l]["rte"]) for l in present]
     std_rte = [np.std(per_method[l]["rte"]) for l in present]
+    mean_rte_short = [np.mean(per_method[l]["rte_short"]) for l in present]
+    std_rte_short = [np.std(per_method[l]["rte_short"]) for l in present]
 
     x = np.arange(len(present))
-    width = 0.35
-    fig, ax = plt.subplots(figsize=(10, 5))
-    bars1 = ax.bar(x - width / 2, mean_ate, width, yerr=std_ate,
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(11, 5))
+    bars1 = ax.bar(x - width, mean_ate, width, yerr=std_ate,
                    label="ATE", color="steelblue", capsize=3)
-    bars2 = ax.bar(x + width / 2, mean_rte, width, yerr=std_rte,
-                   label="RTE", color="salmon", capsize=3)
+    bars2 = ax.bar(x, mean_rte, width, yerr=std_rte,
+                   label="RTE 60s", color="salmon", capsize=3)
+    bars3 = ax.bar(x + width, mean_rte_short, width, yerr=std_rte_short,
+                   label="RTE short", color="seagreen", capsize=3)
     ax.set_xticks(x)
     ax.set_xticklabels(present, rotation=30, ha="right", fontsize=9)
     ax.set_ylabel("Error (m)")
     ax.set_title(f"Mean ATE / RTE Across {len(all_results)} Trajectories", fontsize=11)
     ax.legend()
-    ax.bar_label(bars1, fmt="%.3f", fontsize=7, padding=2)
-    ax.bar_label(bars2, fmt="%.3f", fontsize=7, padding=2)
+    ax.bar_label(bars1, fmt="%.3f", fontsize=6, padding=2)
+    ax.bar_label(bars2, fmt="%.3f", fontsize=6, padding=2)
+    ax.bar_label(bars3, fmt="%.3f", fontsize=6, padding=2)
     fig.tight_layout()
     fig.savefig(osp.join(outdir, "aggregate_ate_rte.png"), dpi=150)
     plt.close(fig)
@@ -402,6 +441,8 @@ def plot_aggregate(all_results, outdir):
             "std_ate": float(np.std(per_method[l]["ate"])),
             "mean_rte": float(np.mean(per_method[l]["rte"])),
             "std_rte": float(np.std(per_method[l]["rte"])),
+            "mean_rte_short": float(np.mean(per_method[l]["rte_short"])),
+            "std_rte_short": float(np.std(per_method[l]["rte_short"])),
             "n": len(per_method[l]["ate"]),
         }
 
@@ -412,17 +453,25 @@ def plot_aggregate(all_results, outdir):
     csv_path = osp.join(outdir, "aggregate_summary.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["method", "mean_ate", "std_ate", "mean_rte", "std_rte", "n"])
+        writer.writerow([
+            "method", "mean_ate", "std_ate", "mean_rte", "std_rte",
+            "mean_rte_short", "std_rte_short", "n",
+        ])
         for l in present:
             s = summary["methods"][l]
-            writer.writerow([l, f"{s['mean_ate']:.4f}", f"{s['std_ate']:.4f}",
-                             f"{s['mean_rte']:.4f}", f"{s['std_rte']:.4f}", s["n"]])
+            writer.writerow([
+                l, f"{s['mean_ate']:.4f}", f"{s['std_ate']:.4f}",
+                f"{s['mean_rte']:.4f}", f"{s['std_rte']:.4f}",
+                f"{s['mean_rte_short']:.4f}", f"{s['std_rte_short']:.4f}", s["n"],
+            ])
 
     print(f"\nAggregate results ({len(all_results)} trajectories):")
     for l in present:
         s = summary["methods"][l]
         print(f"  {l:25s}  ATE={s['mean_ate']:.4f}±{s['std_ate']:.4f}  "
-              f"RTE={s['mean_rte']:.4f}±{s['std_rte']:.4f}  (n={s['n']})")
+              f"RTE_60s={s['mean_rte']:.4f}±{s['std_rte']:.4f}  "
+              f"RTE_short={s['mean_rte_short']:.4f}±{s['std_rte_short']:.4f}  "
+              f"(n={s['n']})")
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +509,11 @@ def main():
                         help="Override LDM config for eval_ronin_ldm_sim_cond.py")
     parser.add_argument("--ddim_steps", type=int, default=50)
     parser.add_argument("--ddim_eta", type=float, default=0.0)
+    parser.add_argument(
+        "--rte_delta_sec", type=float, default=10.0,
+        help="Second RTE window in seconds forwarded to eval subprocesses "
+             "(in addition to the default 60s RTE)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--dry_run", action="store_true",

@@ -632,17 +632,35 @@ def compute_rte(est, gt, delta):
     return float(np.sqrt(np.mean(err ** 2)))
 
 
+def compute_rte_at_delta(est, gt, delta):
+    if delta <= 0:
+        return 0.0
+    if est.shape[0] < delta:
+        ratio = delta / est.shape[0]
+        return compute_rte(est, gt, est.shape[0] - 1) * ratio
+    return compute_rte(est, gt, delta)
+
+
 def compute_ate_rte(est, gt, pred_per_min=12000):
     ate = compute_ate(est, gt)
-    if est.shape[0] < pred_per_min:
-        ratio = pred_per_min / est.shape[0]
-        rte = compute_rte(est, gt, est.shape[0] - 1) * ratio
-    else:
-        rte = compute_rte(est, gt, pred_per_min)
+    rte = compute_rte_at_delta(est, gt, pred_per_min)
     return ate, rte
 
 
-def run_ronin_pipeline(network, dataset, device, use_3d=False):
+def format_rte_sec(sec):
+    if float(sec).is_integer():
+        return f"{int(sec)}s"
+    return f"{sec:g}s"
+
+
+def rte_title_suffix(res, rte_delta_sec):
+    short = format_rte_sec(rte_delta_sec)
+    return (f"ATE={res['ate']:.3f}  "
+            f"RTE_60s={res['rte']:.3f}  "
+            f"RTE_{short}={res['rte_short']:.3f}")
+
+
+def run_ronin_pipeline(network, dataset, device, use_3d=False, rte_delta=None):
     loader = DataLoader(dataset, batch_size=1024, shuffle=False)
     targets, preds = run_test(network, loader, device)
 
@@ -654,10 +672,13 @@ def run_ronin_pipeline(network, dataset, device, use_3d=False):
         pos_gt = dataset.gt_pos[0][:, :2]
 
     ate, rte = compute_ate_rte(pos_pred, pos_gt, SAMPLE_RATE * 60)
+    if rte_delta is None:
+        rte_delta = SAMPLE_RATE * 10
+    rte_short = compute_rte_at_delta(pos_pred, pos_gt, int(rte_delta))
     return {
         "preds": preds, "targets": targets,
         "pos_pred": pos_pred, "pos_gt": pos_gt,
-        "ate": ate, "rte": rte,
+        "ate": ate, "rte": rte, "rte_short": rte_short,
     }
 
 
@@ -665,19 +686,19 @@ def run_ronin_pipeline(network, dataset, device, use_3d=False):
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_trajectories(res_orig, res_recon, outdir, use_3d=False):
+def plot_trajectories(res_orig, res_recon, outdir, use_3d=False, rte_delta_sec=10.0):
     fig, axes = plt.subplots(1, 3, figsize=(20, 7))
 
     ax = axes[0]
     ax.plot(res_orig["pos_gt"][:, 0], res_orig["pos_gt"][:, 1], "k-", lw=1.2, label="GT")
     ax.plot(res_orig["pos_pred"][:, 0], res_orig["pos_pred"][:, 1], "b-", lw=1.0, alpha=0.85, label="RoNIN")
-    ax.set_title(f"Original IMU\nATE={res_orig['ate']:.3f}  RTE={res_orig['rte']:.3f}")
+    ax.set_title(f"Original IMU\n{rte_title_suffix(res_orig, rte_delta_sec)}")
     ax.legend(fontsize=8); ax.set_aspect("equal"); ax.grid(True, alpha=0.25)
 
     ax = axes[1]
     ax.plot(res_recon["pos_gt"][:, 0], res_recon["pos_gt"][:, 1], "k-", lw=1.2, label="GT")
     ax.plot(res_recon["pos_pred"][:, 0], res_recon["pos_pred"][:, 1], "r-", lw=1.0, alpha=0.85, label="RoNIN (LDM gen)")
-    ax.set_title(f"LDM-Generated IMU\nATE={res_recon['ate']:.3f}  RTE={res_recon['rte']:.3f}")
+    ax.set_title(f"LDM-Generated IMU\n{rte_title_suffix(res_recon, rte_delta_sec)}")
     ax.legend(fontsize=8); ax.set_aspect("equal"); ax.grid(True, alpha=0.25)
 
     ax = axes[2]
@@ -908,6 +929,10 @@ def main():
     parser.add_argument("--arch", type=str, default="resnet18")
     parser.add_argument("--window_size", type=int, default=200)
     parser.add_argument("--step_size", type=int, default=10)
+    parser.add_argument(
+        "--rte_delta_sec", type=float, default=10.0,
+        help="Second RTE window in seconds (in addition to the default 60s RTE)",
+    )
     parser.add_argument("--ddim_steps", type=int, default=50)
     parser.add_argument("--ddim_eta", type=float, default=0.0)
     parser.add_argument(
@@ -1119,13 +1144,23 @@ def main():
     dataset_gen.features[0] = features_gen
 
     # ---- RoNIN on both ----
+    rte_delta = int(round(args.rte_delta_sec * SAMPLE_RATE))
+    rte_short_label = format_rte_sec(args.rte_delta_sec)
     print("Running RoNIN on original IMU ...")
-    res_orig = run_ronin_pipeline(ronin_net, dataset_orig, device, use_3d=args.use_3d)
-    print(f"  Original   — ATE: {res_orig['ate']:.4f}, RTE: {res_orig['rte']:.4f}")
+    res_orig = run_ronin_pipeline(
+        ronin_net, dataset_orig, device, use_3d=args.use_3d, rte_delta=rte_delta,
+    )
+    print(f"  Original   — ATE: {res_orig['ate']:.4f}, "
+          f"RTE_60s: {res_orig['rte']:.4f}, "
+          f"RTE_{rte_short_label}: {res_orig['rte_short']:.4f}")
 
     print("Running RoNIN on LDM-generated IMU ...")
-    res_gen = run_ronin_pipeline(ronin_net, dataset_gen, device, use_3d=args.use_3d)
-    print(f"  LDM gen    — ATE: {res_gen['ate']:.4f}, RTE: {res_gen['rte']:.4f}")
+    res_gen = run_ronin_pipeline(
+        ronin_net, dataset_gen, device, use_3d=args.use_3d, rte_delta=rte_delta,
+    )
+    print(f"  LDM gen    — ATE: {res_gen['ate']:.4f}, "
+          f"RTE_60s: {res_gen['rte']:.4f}, "
+          f"RTE_{rte_short_label}: {res_gen['rte_short']:.4f}")
 
     # ---- Metrics ----
     metrics = {
@@ -1146,11 +1181,19 @@ def main():
         "ddim_eta": args.ddim_eta,
         "strength": args.strength,
         "scale_factor": float(ldm.scale_factor),
-        "original": {"ate": res_orig["ate"], "rte": res_orig["rte"]},
-        "ldm_gen": {"ate": res_gen["ate"], "rte": res_gen["rte"]},
+        "rte_delta_sec": args.rte_delta_sec,
+        "original": {
+            "ate": res_orig["ate"], "rte": res_orig["rte"],
+            "rte_short": res_orig["rte_short"],
+        },
+        "ldm_gen": {
+            "ate": res_gen["ate"], "rte": res_gen["rte"],
+            "rte_short": res_gen["rte_short"],
+        },
         "delta": {
             "ate": res_gen["ate"] - res_orig["ate"],
             "rte": res_gen["rte"] - res_orig["rte"],
+            "rte_short": res_gen["rte_short"] - res_orig["rte_short"],
         },
     }
     metrics_path = osp.join(args.outdir, "metrics.json")
@@ -1171,7 +1214,10 @@ def main():
         print(f"Trajectories saved to {traj_path}")
 
     # ---- Plots ----
-    plot_trajectories(res_orig, res_gen, args.outdir, use_3d=args.use_3d)
+    plot_trajectories(
+        res_orig, res_gen, args.outdir, use_3d=args.use_3d,
+        rte_delta_sec=args.rte_delta_sec,
+    )
     plot_position_error(res_orig, res_gen, args.outdir)
     plot_imu_windows(features_orig, features_gen, args.outdir, n_plot=args.n_imu_plot)
 
