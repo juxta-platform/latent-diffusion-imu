@@ -4,6 +4,7 @@
 Modes:
   sim_cond  — sim-conditioned LDM (eval_ldm_1d_sim_cond). Conditions on
               trajectory velocity plus synthetic parquet IMU latent.
+              Generates IMU from noise; real.hdf5 is optional.
   traj      — trajectory-conditioned LDM (eval_ldm_1d / eval_ronin_ldm).
               Conditions only on velocities from real.hdf5 tango_pos;
               skips synthetic parquets.
@@ -77,11 +78,18 @@ def resolve_manifest_path(value, repo_root, pair_dir):
     return next((p for p in candidates if p.is_file()), candidates[0])
 
 
+def path_is_file(path):
+    return path is not None and path.is_file()
+
+
 def resolve_pair_files(row, pairs_root, repo_root, sim_root=None):
     pair_id = row["pair_id"].strip()
     pair_dir = pairs_root / pair_id
     trajectory = resolve_manifest_path(row.get("trajectory_txt"), repo_root, pair_dir)
     real = resolve_manifest_path(row.get("real_hdf5"), repo_root, pair_dir)
+    if real is None:
+        fallback_real = pair_dir / "real.hdf5"
+        real = fallback_real if fallback_real.is_file() else None
 
     sim_candidates = []
     if sim_root is not None:
@@ -138,7 +146,12 @@ def load_real_hdf5(real_path):
     return time, position, orientation, real_imu
 
 
-def load_pair(trajectory_path, synthetic_path, real_path):
+def load_pair(trajectory_path, synthetic_path, real_path=None):
+    """Load trajectory + synthetic IMU; real.hdf5 is optional for LDM generation.
+
+    Without real.hdf5, sequence length comes from trajectory/sim only and the
+    generated remainder shorter than one window is trimmed (no real IMU tail).
+    """
     trajectory = np.loadtxt(trajectory_path, dtype=np.float64)
     if trajectory.ndim != 2 or trajectory.shape[1] < 8:
         raise ValueError(
@@ -154,14 +167,19 @@ def load_pair(trajectory_path, synthetic_path, real_path):
     if missing:
         raise ValueError(f"{synthetic_path} missing columns: {missing}")
 
-    _, _, _, real_imu = load_real_hdf5(real_path)
+    lengths = [len(trajectory), len(sim)]
+    real_imu = None
+    if real_path is not None:
+        _, _, _, real_imu = load_real_hdf5(real_path)
+        lengths.append(len(real_imu))
 
-    n = min(len(trajectory), len(sim), len(real_imu))
+    n = min(lengths)
     time = trajectory[:n, 0]
     position = trajectory[:n, 1:4]
     orientation = trajectory[:n, 4:8]
     sim_imu = sim.loc[:, columns].iloc[:n].to_numpy(dtype=np.float32)
-    real_imu = real_imu[:n]
+    if real_imu is not None:
+        real_imu = real_imu[:n]
 
     if n < 2 or np.any(np.diff(time) <= 0):
         raise ValueError(f"{trajectory_path} has non-increasing or insufficient timestamps")
@@ -221,14 +239,24 @@ def generate_sequence(
     use_ema,
     trim_tail,
 ):
-    n_samples = len(real_imu)
+    n_samples = len(time)
     starts = window_starts(n_samples, window, stride)
     if not starts:
         raise ValueError(f"sequence has {n_samples} samples, fewer than window {window}")
 
-    # Match eval_ronin_ldm*.py: replace full generated windows and
-    # retain world-frame real IMU for a remainder shorter than one window.
-    output = real_imu.copy()
+    # LDM fills complete windows from noise. If real IMU is available and
+    # --trim_tail is off, keep world-frame real IMU for a short remainder;
+    # otherwise initialize from zeros and trim the remainder.
+    if real_imu is None:
+        output = np.zeros((n_samples, 6), dtype=np.float32)
+        retain_real_tail = False
+    else:
+        if len(real_imu) != n_samples:
+            raise ValueError(
+                f"real IMU length {len(real_imu)} != trajectory length {n_samples}"
+            )
+        output = real_imu.copy()
+        retain_real_tail = not trim_tail
     imu_mean = stats["imu_mean"].to(device)
     imu_std = stats["imu_std"].to(device)
     z_channels = int(getattr(model.first_stage_model, "embed_dim", 8))
@@ -276,11 +304,11 @@ def generate_sequence(
 
     tail = n_samples - (starts[-1] + window)
     if tail > 0:
-        if trim_tail:
+        if retain_real_tail:
+            print(f"    retained {tail} trailing real IMU samples")
+        else:
             output = output[:-tail]
             print(f"    trimmed {tail} trailing samples")
-        else:
-            print(f"    retained {tail} trailing real IMU samples")
     return output.astype(np.float32)
 
 
@@ -372,7 +400,8 @@ def main():
     parser.add_argument("--no_ema", action="store_true")
     parser.add_argument("--trim_tail", action="store_true",
                         help="Trim a remainder shorter than one LDM window instead "
-                             "of retaining world-frame real IMU")
+                             "of retaining world-frame real IMU. Always applied when "
+                             "real.hdf5 is absent.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--strict", action="store_true",
                         help="Stop at the first missing or failed pair")
@@ -406,8 +435,11 @@ def main():
 
     def pair_ready(trajectory, synthetic, real):
         if args.mode == "traj":
-            return real.is_file()
-        return trajectory.is_file() and synthetic.is_file() and real.is_file()
+            # Traj mode conditions on velocities from real.hdf5 tango_pos.
+            return path_is_file(real)
+        # sim_cond generates IMU from noise using trajectory + synthetic latent.
+        # real.hdf5 is optional (only used to retain a short real IMU tail).
+        return path_is_file(trajectory) and path_is_file(synthetic)
 
     runnable = [
         item for item in resolved
@@ -424,12 +456,12 @@ def main():
             continue
         missing.append({
             "pair_id": pair_id,
-            "trajectory": str(trajectory),
-            "trajectory_exists": trajectory.is_file(),
-            "synthetic": str(synthetic),
-            "synthetic_exists": synthetic.is_file(),
-            "real": str(real),
-            "real_exists": real.is_file(),
+            "trajectory": None if trajectory is None else str(trajectory),
+            "trajectory_exists": path_is_file(trajectory),
+            "synthetic": None if synthetic is None else str(synthetic),
+            "synthetic_exists": path_is_file(synthetic),
+            "real": None if real is None else str(real),
+            "real_exists": path_is_file(real),
         })
     if missing:
         print(f"Missing inputs for {len(missing)} pairs")
@@ -444,8 +476,9 @@ def main():
         return
     if not runnable:
         raise FileNotFoundError(
-            "No runnable pairs. For sim_cond, restore synthetic.parquet files or "
-            "pass --sim_root. For traj, each pair needs real.hdf5."
+            "No runnable pairs. For sim_cond, each pair needs trajectory.txt and "
+            "synthetic.parquet (real.hdf5 optional). For traj, each pair needs "
+            "real.hdf5."
         )
 
     stats_path = args.stats or (
@@ -484,7 +517,8 @@ def main():
                 sim_imu = None
             else:
                 time, position, orientation, sim_imu, real_imu = load_pair(
-                    trajectory_path, synthetic_path, real_path
+                    trajectory_path, synthetic_path,
+                    real_path if path_is_file(real_path) else None,
                 )
             generated = generate_sequence(
                 model, sampler, stats, time, position, sim_imu, real_imu, device,
@@ -492,6 +526,7 @@ def main():
                 args.ddim_steps, args.ddim_eta, not args.no_ema, args.trim_tail,
             )
             output_len = len(generated)
+            has_real = path_is_file(real_path)
             metadata = {
                 "pair_id": pair_id,
                 "output_stem": stem,
@@ -500,7 +535,7 @@ def main():
                 "synthetic_source": (
                     None if args.mode == "traj" else str(synthetic_path.resolve())
                 ),
-                "real_source": str(real_path.resolve()),
+                "real_source": str(real_path.resolve()) if has_real else None,
                 "trajectory_source": (
                     str(real_path.resolve()) if args.mode == "traj"
                     else str(trajectory_path.resolve())
@@ -512,7 +547,9 @@ def main():
                 "seed": args.seed,
                 "ddim_steps": args.ddim_steps,
                 "ddim_eta": args.ddim_eta,
-                "tail_mode": "trim" if args.trim_tail else "real",
+                "tail_mode": (
+                    "real" if has_real and not args.trim_tail else "trim"
+                ),
             }
             write_hdf5(
                 output_path, time[:output_len], position[:output_len],

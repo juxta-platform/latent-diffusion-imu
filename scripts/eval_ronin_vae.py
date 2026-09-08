@@ -1,9 +1,9 @@
 """Evaluate RoNIN trajectory on original vs VAE-reconstructed IMU.
 
-Loads a single parquet or hdf5 recording, runs RoNIN inference on the
-original IMU, then reconstructs the IMU through a trained VAE (in
-non-overlapping 10s windows) and runs RoNIN again. Produces side-by-side
-trajectory plots and ATE/RTE metrics.
+Loads a parquet/hdf5 recording (or a directory of them), runs RoNIN on the
+original IMU, then reconstructs IMU through a trained VAE (non-overlapping
+10s windows) and runs RoNIN again. Produces side-by-side trajectory plots
+and ATE/RTE metrics.
 
 Example usage (parquet):
     python scripts/eval_ronin_vae.py \
@@ -21,6 +21,14 @@ Example usage (hdf5):
         --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
         --stats data/dataset_processed_overlapped/stats.pt \
         --outdir outputs/ronin_vae_eval
+
+Example usage (directory of pair folders, e.g. tlio_head):
+    python scripts/eval_ronin_vae.py \
+        --input_dir data/tlio_head \
+        --vae_ckpt logs/vae_1d/world_full_dataset/checkpoints/best-064.ckpt \
+        --ronin_ckpt path/to/ronin/checkpoint_latest.pt \
+        --stats data/dataset_full_processed_overlapped/stats.pt \
+        --outdir outputs/vae_world/tlio_head
 """
 
 import argparse
@@ -533,6 +541,206 @@ def plot_imu_windows(feat_orig, feat_recon, outdir, n_plot=4):
 
 
 # ---------------------------------------------------------------------------
+# Directory discovery
+# ---------------------------------------------------------------------------
+
+_TRAJ_EXTS = (".hdf5", ".h5", ".parquet")
+
+
+def list_input_files(input_dir):
+    """Discover trajectory files under input_dir.
+
+    Prefer top-level .hdf5 / .parquet. If none, recursively pick real.hdf5 from
+    pair folders (e.g. data/tlio_head/head/<id>/real.hdf5).
+    """
+    files = []
+    for name in sorted(os.listdir(input_dir)):
+        path = osp.join(input_dir, name)
+        if osp.isfile(path) and osp.splitext(name)[1].lower() in _TRAJ_EXTS:
+            files.append(path)
+    if files:
+        return files
+    return sorted(
+        osp.join(root, "real.hdf5")
+        for root, _dirs, fnames in os.walk(input_dir)
+        if "real.hdf5" in fnames
+    )
+
+
+def output_name(path, input_dir):
+    """Flattened subdirectory name for one input under a root."""
+    rel = osp.splitext(osp.relpath(path, input_dir))[0]
+    if osp.basename(rel) == "real":
+        rel = osp.dirname(rel)
+    return rel.replace(os.sep, "_") or osp.basename(osp.abspath(input_dir))
+
+
+def resolve_dataset_type(input_path, dataset_override=None):
+    if dataset_override is not None:
+        return dataset_override
+    ext = osp.splitext(input_path)[1].lower()
+    if ext == ".parquet":
+        return "sim_parquet"
+    if ext in (".hdf5", ".h5"):
+        return "hybrid"
+    raise ValueError(f"Cannot auto-detect dataset type for {ext}. Use --dataset.")
+
+
+# ---------------------------------------------------------------------------
+# Single-trajectory eval
+# ---------------------------------------------------------------------------
+
+def evaluate_one(input_path, outdir, vae, imu_mean, imu_std, ronin_net, device, args):
+    """Run original vs VAE-recon RoNIN eval for one recording. Returns metrics dict."""
+    os.makedirs(outdir, exist_ok=True)
+    dataset_type = resolve_dataset_type(input_path, args.dataset)
+    print(f"Input:   {input_path}")
+    print(f"Dataset: {dataset_type}")
+    print(f"Outdir:  {outdir}")
+
+    print("Loading data ...")
+    path = input_path.rstrip("/")
+    root_dir = osp.split(path)[0]
+    data_name = osp.split(path)[1]
+    for suffix in _TRAJ_EXTS:
+        if data_name.endswith(suffix):
+            data_name = data_name[:-len(suffix)]
+            break
+
+    seq_type = _ParquetSequence if dataset_type == "sim_parquet" else _HDF5Sequence
+    dataset_orig = _StridedDataset(
+        seq_type, root_dir, [data_name],
+        step_size=args.step_size, window_size=args.window_size,
+    )
+    features_orig = dataset_orig.features[0]
+    N = features_orig.shape[0]
+    n_vae_windows = N // VAE_WINDOW
+    print(f"  {N} samples ({N / SAMPLE_RATE:.1f}s), {n_vae_windows} full 10s VAE windows, "
+          f"{len(dataset_orig)} RoNIN windows")
+
+    print("\nRunning VAE reconstruction ...")
+    features_recon = reconstruct_features_vae(features_orig, vae, imu_mean, imu_std, device)
+
+    dataset_recon = copy.deepcopy(dataset_orig)
+    dataset_recon.features[0] = features_recon
+
+    rte_delta = int(round(args.rte_delta_sec * SAMPLE_RATE))
+    rte_short_label = format_rte_sec(args.rte_delta_sec)
+    print("Running RoNIN on original IMU ...")
+    res_orig = run_ronin_pipeline(
+        ronin_net, dataset_orig, device, use_3d=args.use_3d, rte_delta=rte_delta,
+    )
+    print(f"  Original   — ATE: {res_orig['ate']:.4f}, "
+          f"RTE_60s: {res_orig['rte']:.4f}, "
+          f"RTE_{rte_short_label}: {res_orig['rte_short']:.4f}")
+
+    print("Running RoNIN on VAE-reconstructed IMU ...")
+    res_recon = run_ronin_pipeline(
+        ronin_net, dataset_recon, device, use_3d=args.use_3d, rte_delta=rte_delta,
+    )
+    print(f"  VAE recon  — ATE: {res_recon['ate']:.4f}, "
+          f"RTE_60s: {res_recon['rte']:.4f}, "
+          f"RTE_{rte_short_label}: {res_recon['rte_short']:.4f}")
+
+    metrics = {
+        "input": osp.abspath(input_path),
+        "dataset_type": dataset_type,
+        "vae_ckpt": osp.abspath(args.vae_ckpt),
+        "ronin_ckpt": osp.abspath(args.ronin_ckpt),
+        "n_samples": int(N),
+        "n_vae_windows": n_vae_windows,
+        "rte_delta_sec": args.rte_delta_sec,
+        "original": {
+            "ate": res_orig["ate"], "rte": res_orig["rte"],
+            "rte_short": res_orig["rte_short"],
+        },
+        "vae_recon": {
+            "ate": res_recon["ate"], "rte": res_recon["rte"],
+            "rte_short": res_recon["rte_short"],
+        },
+        "delta": {
+            "ate": res_recon["ate"] - res_orig["ate"],
+            "rte": res_recon["rte"] - res_orig["rte"],
+            "rte_short": res_recon["rte_short"] - res_orig["rte_short"],
+        },
+    }
+    metrics_path = osp.join(outdir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"\nMetrics saved to {metrics_path}")
+
+    plot_trajectories(
+        res_orig, res_recon, outdir, use_3d=args.use_3d,
+        rte_delta_sec=args.rte_delta_sec,
+    )
+    plot_position_error(res_orig, res_recon, outdir)
+    plot_imu_windows(features_orig, features_recon, outdir, n_plot=args.n_imu_plot)
+    return metrics
+
+
+def _mean_metric(rows, side, key):
+    vals = [r[side][key] for r in rows]
+    return float(np.mean(vals)) if vals else None
+
+
+def evaluate_directory(input_dir, outdir, vae, imu_mean, imu_std, ronin_net, device, args):
+    files = list_input_files(input_dir)
+    if not files:
+        raise ValueError(
+            f"No .hdf5 / .parquet / real.hdf5 files found under {input_dir}"
+        )
+    print(f"Found {len(files)} trajectories under {input_dir}")
+
+    per_traj = []
+    failures = []
+    for i, path in enumerate(files, 1):
+        name = output_name(path, input_dir)
+        traj_outdir = osp.join(outdir, name)
+        print(f"\n========== [{i}/{len(files)}] {name} ==========")
+        try:
+            metrics = evaluate_one(
+                path, traj_outdir, vae, imu_mean, imu_std, ronin_net, device, args,
+            )
+            per_traj.append({"name": name, **metrics})
+        except Exception as exc:
+            print(f"  FAILED: {exc}")
+            failures.append({"name": name, "input": path, "error": repr(exc)})
+            if args.strict:
+                raise
+
+    summary = {
+        "input_dir": osp.abspath(input_dir),
+        "outdir": osp.abspath(outdir),
+        "vae_ckpt": osp.abspath(args.vae_ckpt),
+        "ronin_ckpt": osp.abspath(args.ronin_ckpt),
+        "n_trajectories": len(per_traj),
+        "n_failures": len(failures),
+        "rte_delta_sec": args.rte_delta_sec,
+        "aggregate": {
+            "original": {
+                "ate_mean": _mean_metric(per_traj, "original", "ate"),
+                "rte_mean": _mean_metric(per_traj, "original", "rte"),
+                "rte_short_mean": _mean_metric(per_traj, "original", "rte_short"),
+            },
+            "vae_recon": {
+                "ate_mean": _mean_metric(per_traj, "vae_recon", "ate"),
+                "rte_mean": _mean_metric(per_traj, "vae_recon", "rte"),
+                "rte_short_mean": _mean_metric(per_traj, "vae_recon", "rte_short"),
+            },
+        },
+        "trajectories": per_traj,
+        "failures": failures,
+    }
+    summary_path = osp.join(outdir, "summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\nDirectory summary ({len(per_traj)} ok, {len(failures)} failed):")
+    print(json.dumps(summary["aggregate"], indent=2))
+    print(f"Saved {summary_path}")
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -540,8 +748,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate RoNIN trajectory on original vs VAE-reconstructed IMU"
     )
-    parser.add_argument("--input", type=str, required=True,
-                        help="Path to .parquet or .hdf5 input file")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Path to one .parquet or .hdf5 input file")
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="Directory of trajectories or pair folders "
+                             "(e.g. data/tlio_head with head/<id>/real.hdf5)")
     parser.add_argument("--vae_config", "--config", type=str,
                         default="configs/imu/vae_1d.yaml",
                         help="VAE model config (must match the checkpoint architecture)")
@@ -563,28 +774,19 @@ def main():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--n_imu_plot", type=int, default=4,
                         help="Number of IMU window overlay plots")
+    parser.add_argument("--strict", action="store_true",
+                        help="With --input_dir, abort on the first failing trajectory")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    if (args.input is None) == (args.input_dir is None):
+        parser.error("Provide exactly one of --input or --input_dir")
 
     torch.manual_seed(args.seed)
     os.makedirs(args.outdir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-
-    ext = osp.splitext(args.input)[1].lower()
-    if args.dataset is not None:
-        dataset_type = args.dataset
-    elif ext == ".parquet":
-        dataset_type = "sim_parquet"
-    elif ext in (".hdf5", ".h5"):
-        dataset_type = "hybrid"
-    else:
-        raise ValueError(f"Cannot auto-detect dataset type for {ext}. Use --dataset.")
-
-    print(f"Input:   {args.input}")
-    print(f"Dataset: {dataset_type}")
     print(f"Device:  {device}")
 
-    # ---- Load models ----
     print("\nLoading VAE ...")
     vae = load_vae(args.vae_config, args.vae_ckpt, device)
     imu_mean, imu_std = load_vae_stats(args.stats)
@@ -598,94 +800,14 @@ def main():
     ronin_net.load_state_dict(ckpt["model_state_dict"])
     ronin_net.eval().to(device)
 
-    # ---- Load data ----
-    print("Loading data ...")
-    input_path = args.input.rstrip("/")
-    root_dir = osp.split(input_path)[0]
-    data_name = osp.split(input_path)[1]
-    # Strip extension (seq loaders append it internally)
-    for suffix in (".parquet", ".hdf5", ".h5"):
-        if data_name.endswith(suffix):
-            data_name = data_name[:-len(suffix)]
-            break
-
-    if dataset_type == "sim_parquet":
-        seq_type = _ParquetSequence
+    if args.input_dir is not None:
+        evaluate_directory(
+            args.input_dir, args.outdir, vae, imu_mean, imu_std, ronin_net, device, args,
+        )
     else:
-        seq_type = _HDF5Sequence
-
-    dataset_orig = _StridedDataset(
-        seq_type, root_dir, [data_name],
-        step_size=args.step_size, window_size=args.window_size,
-    )
-    features_orig = dataset_orig.features[0]
-    N = features_orig.shape[0]
-    n_vae_windows = N // VAE_WINDOW
-    print(f"  {N} samples ({N / SAMPLE_RATE:.1f}s), {n_vae_windows} full 10s VAE windows, "
-          f"{len(dataset_orig)} RoNIN windows")
-
-    # ---- VAE reconstruction ----
-    print("\nRunning VAE reconstruction ...")
-    features_recon = reconstruct_features_vae(features_orig, vae, imu_mean, imu_std, device)
-
-    dataset_recon = copy.deepcopy(dataset_orig)
-    dataset_recon.features[0] = features_recon
-
-    # ---- RoNIN on both ----
-    rte_delta = int(round(args.rte_delta_sec * SAMPLE_RATE))
-    rte_short_label = format_rte_sec(args.rte_delta_sec)
-    print("Running RoNIN on original IMU ...")
-    res_orig = run_ronin_pipeline(
-        ronin_net, dataset_orig, device, use_3d=args.use_3d, rte_delta=rte_delta,
-    )
-    print(f"  Original   — ATE: {res_orig['ate']:.4f}, "
-          f"RTE_60s: {res_orig['rte']:.4f}, "
-          f"RTE_{rte_short_label}: {res_orig['rte_short']:.4f}")
-
-    print("Running RoNIN on VAE-reconstructed IMU ...")
-    res_recon = run_ronin_pipeline(
-        ronin_net, dataset_recon, device, use_3d=args.use_3d, rte_delta=rte_delta,
-    )
-    print(f"  VAE recon  — ATE: {res_recon['ate']:.4f}, "
-          f"RTE_60s: {res_recon['rte']:.4f}, "
-          f"RTE_{rte_short_label}: {res_recon['rte_short']:.4f}")
-
-    # ---- Metrics ----
-    metrics = {
-        "input": osp.abspath(args.input),
-        "dataset_type": dataset_type,
-        "vae_ckpt": osp.abspath(args.vae_ckpt),
-        "ronin_ckpt": osp.abspath(args.ronin_ckpt),
-        "n_samples": int(N),
-        "n_vae_windows": n_vae_windows,
-        "rte_delta_sec": args.rte_delta_sec,
-        "original": {
-            "ate": res_orig["ate"], "rte": res_orig["rte"],
-            "rte_short": res_orig["rte_short"],
-        },
-        "vae_recon": {
-            "ate": res_recon["ate"], "rte": res_recon["rte"],
-            "rte_short": res_recon["rte_short"],
-        },
-        "delta": {
-            "ate": res_recon["ate"] - res_orig["ate"],
-            "rte": res_recon["rte"] - res_orig["rte"],
-            "rte_short": res_recon["rte_short"] - res_orig["rte_short"],
-        },
-    }
-    metrics_path = osp.join(args.outdir, "metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"\nMetrics saved to {metrics_path}")
-    print(json.dumps(metrics, indent=2))
-
-    # ---- Plots ----
-    plot_trajectories(
-        res_orig, res_recon, args.outdir, use_3d=args.use_3d,
-        rte_delta_sec=args.rte_delta_sec,
-    )
-    plot_position_error(res_orig, res_recon, args.outdir)
-    plot_imu_windows(features_orig, features_recon, args.outdir, n_plot=args.n_imu_plot)
+        evaluate_one(
+            args.input, args.outdir, vae, imu_mean, imu_std, ronin_net, device, args,
+        )
 
     print(f"\nDone. Results in {args.outdir}")
 
