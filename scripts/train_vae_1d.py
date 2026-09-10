@@ -6,14 +6,14 @@ python scripts/train_vae_1d.py --config configs/imu/vae_1d.yaml --name my_exp da
 
 import argparse
 import os
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import pytorch_lightning as pl
+
+from ldm.evaluation.constants import STATS_NAME
 from omegaconf import OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from ldm.util import instantiate_from_config
@@ -27,6 +27,8 @@ def main():
                         help="Experiment name (used as log folder instead of version_N)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--imu_frame", choices=["local", "world"], default=None,
+                        help="Training data frame, saved in the checkpoint (default: world)")
     args, unknown = parser.parse_known_args()
 
     pl.seed_everything(args.seed)
@@ -34,6 +36,7 @@ def main():
     config = OmegaConf.load(args.config)
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(config, cli)
+    config.model.params.imu_frame = args.imu_frame or config.model.params.get("imu_frame") or "world"
 
     model = instantiate_from_config(config.model)
     data = instantiate_from_config(config.data)
@@ -41,7 +44,7 @@ def main():
     # Embed standardization stats into the model so they survive in checkpoints
     data_dir = OmegaConf.to_container(config.data.params, resolve=True).get("data_dir")
     if data_dir is not None:
-        stats_path = os.path.join(data_dir, "stats.pt")
+        stats_path = os.path.join(data_dir, STATS_NAME)
         if os.path.isfile(stats_path):
             stats = torch.load(stats_path, weights_only=True)
             model.set_stats(stats)

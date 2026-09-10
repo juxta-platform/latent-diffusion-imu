@@ -40,7 +40,13 @@ class LatentDiffusion1D(pl.LightningModule):
         self.monitor = monitor
 
         self.first_stage_model = instantiate_from_config(first_stage_config)
-        sd = torch.load(first_stage_ckpt, map_location="cpu")
+        from ldm.evaluation.models import require_world_vae
+
+        sd = torch.load(first_stage_ckpt, map_location="cpu", weights_only=False)
+        require_world_vae(sd, first_stage_ckpt)
+        if getattr(self.first_stage_model, "imu_frame", None) == "local":
+            raise ValueError("The LDM requires a world-frame first-stage VAE")
+        self.first_stage_model.imu_frame = "world"
         if "state_dict" in sd:
             sd = sd["state_dict"]
         missing, unexpected = self.first_stage_model.load_state_dict(sd, strict=False)
@@ -63,6 +69,9 @@ class LatentDiffusion1D(pl.LightningModule):
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["first_stage_imu_frame"] = "world"
 
     def init_from_ckpt(self, path, ignore_keys=None):
         sd = torch.load(path, map_location="cpu")

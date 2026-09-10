@@ -16,12 +16,16 @@ class AutoencoderKL1D(pl.LightningModule):
                  input_key="imu",
                  monitor=None,
                  learning_rate=1e-4,
+                 imu_frame=None,
                  ):
         super().__init__()
         self.input_key = input_key
         self.embed_dim = embed_dim
         self.kl_weight = kl_weight
         self.learning_rate = learning_rate
+        if imu_frame not in (None, "local", "world"):
+            raise ValueError(f"Invalid imu_frame: {imu_frame!r}")
+        self.imu_frame = imu_frame
 
         self.encoder = Encoder1D(**ddconfig)
         self.decoder = Decoder1D(**ddconfig)
@@ -41,6 +45,7 @@ class AutoencoderKL1D(pl.LightningModule):
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")
+        self.on_load_checkpoint(sd)
         if "state_dict" in sd:
             sd = sd["state_dict"]
         keys = list(sd.keys())
@@ -49,6 +54,12 @@ class AutoencoderKL1D(pl.LightningModule):
                 if k.startswith(ik):
                     del sd[k]
         self.load_state_dict(sd, strict=False)
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["imu_frame"] = self.imu_frame or "world"
+
+    def on_load_checkpoint(self, checkpoint):
+        self.imu_frame = checkpoint.get("imu_frame", self.imu_frame)
 
     def encode(self, x):
         h = self.encoder(x)

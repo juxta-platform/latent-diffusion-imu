@@ -25,8 +25,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 
-
-CHANNEL_NAMES = ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]
+from ldm.evaluation.constants import CHANNEL_NAMES
 
 
 def load_synced_imu(path):

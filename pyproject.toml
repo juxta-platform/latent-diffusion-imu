@@ -1,0 +1,42 @@
+[build-system]
+# Upper bound: setuptools >= 69.3 vendors packaging 24, which an older
+# packaging in the target environment shadows (see README, Installation).
+requires = ["setuptools>=61,<69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latent-diffusion"
+version = "0.0.1"
+description = "Latent diffusion for IMU sequence generation"
+requires-python = ">=3.8"
+
+# The IMU pipeline (VAE, LDM, carrying classifier, RoNIN evaluation). Left
+# unpinned so an existing environment satisfies them as-is; the versions this
+# repo is developed against are recorded in environment.yaml.
+dependencies = [
+    "torch",
+    "torchvision",
+    "pytorch-lightning",
+    "numpy",
+    "scipy",
+    "pandas",
+    "pyarrow",
+    "h5py",
+    "numpy-quaternion",
+    "matplotlib",
+    "scikit-learn",
+    "omegaconf",
+    "einops",
+    "tqdm",
+    "PyYAML",
+    "Pillow",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+# Upstream latent-diffusion image models, unused by the IMU pipeline.
+image = ["albumentations", "opencv-python", "kornia", "transformers"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["ldm*"]

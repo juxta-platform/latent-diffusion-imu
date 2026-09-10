@@ -1,8 +1,5 @@
 """Smoke tests for 1D diffusion training and inference pipeline."""
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import numpy as np

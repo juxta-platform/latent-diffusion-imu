@@ -1,8 +1,5 @@
 """Shape tests for 1D VAE and U-Net models."""
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import pytest

@@ -7,14 +7,11 @@ python scripts/train_ldm_1d.py --config configs/imu/ldm_1d.yaml --name my_exp \
 """
 
 import argparse
-import os
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from ldm.util import instantiate_from_config

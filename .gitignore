@@ -50,3 +50,7 @@ Thumbs.db
 
 # Data
 data/
+!ldm/data/
+ldm/data/*
+!ldm/data/carrying_dataset.py
+!ldm/data/carrying_labels.py

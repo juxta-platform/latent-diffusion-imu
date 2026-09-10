@@ -1,13 +1,8 @@
-from setuptools import setup, find_packages
+"""Shim for editable installs on pip < 21.3, which predates PEP 660.
 
-setup(
-    name='latent-diffusion',
-    version='0.0.1',
-    description='',
-    packages=find_packages(),
-    install_requires=[
-        'torch',
-        'numpy',
-        'tqdm',
-    ],
-)
+All project metadata lives in pyproject.toml.
+"""
+
+from setuptools import setup
+
+setup()
